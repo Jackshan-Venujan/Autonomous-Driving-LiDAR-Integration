@@ -104,25 +104,52 @@ def main():
     def cleanup():
         nonlocal vehicle, lidar_mgr, viewer, traffic_actors
         print("\n[Viewer] Cleaning up...")
+
+        # 1. Close the Open3D window first
         if viewer is not None:
             viewer.destroy()
             viewer = None
+
+        # 2. Shutdown LiDAR (stop listener + destroy sensor)
         if lidar_mgr is not None:
             lidar_mgr.shutdown()
             lidar_mgr = None
+
+        # 3. Small delay to let CARLA drain any in-flight callbacks
+        time.sleep(0.5)
+
+        # 4. Disable autopilot on traffic before destroying
         for a in traffic_actors:
             try:
-                a.destroy()
+                a.set_autopilot(False)
             except Exception:
                 pass
+        # 5. Destroy traffic actors
+        if traffic_actors:
+            try:
+                # Batch destroy is safer than one-by-one
+                client.apply_batch([carla.command.DestroyActor(a) for a in traffic_actors])
+            except Exception:
+                for a in traffic_actors:
+                    try:
+                        a.destroy()
+                    except Exception:
+                        pass
         traffic_actors.clear()
+
+        # 6. Disable autopilot + destroy ego vehicle last
         if vehicle is not None:
+            try:
+                vehicle.set_autopilot(False)
+            except Exception:
+                pass
             try:
                 vehicle.destroy()
                 print("[Viewer]   ✓ Vehicle destroyed")
             except Exception:
                 pass
             vehicle = None
+
         print("[Viewer] ✓ Cleanup complete")
 
     def signal_handler(sig, frame):
