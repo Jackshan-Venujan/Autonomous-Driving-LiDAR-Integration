@@ -7,6 +7,7 @@ import carla
 import cv2
 import time
 import sys
+import subprocess
 
 from modules.driving_agent import DrivingAgent
 from modules.lidar_based_obstacle_detector import LidarManager
@@ -111,6 +112,7 @@ class AutonomousDrivingSystem:
         print("  [V] = Toggle Lane Mask Visualization")
         print("  [T] = Toggle Lead Vehicle (test your model!)")
         print("  [P] = Print LiDAR Stats")
+        print("  [O] = Open LiDAR 3D Viewer (separate window, needs open3d)")
         print("  [N] = Night  [B] = Bright (Day)")
         print("  [W/A/S/D] = Manual throttle/brake/steering")
         print("  [Space] = Brake")
@@ -171,6 +173,10 @@ class AutonomousDrivingSystem:
                 # Print LiDAR throughput stats
                 elif key == ord('p'):
                     self.lidar_manager.print_stats()
+                
+                # Launch LiDAR 3D viewer in a separate process
+                elif key == ord('o'):
+                    self._launch_lidar_viewer()
                 
                 # NEW: Toggle lead vehicle
                 elif key == ord('t'):
@@ -272,6 +278,40 @@ class AutonomousDrivingSystem:
             print(f"   ⚠️ Vehicle cleanup error: {e}")
         
         print("✓ Cleanup complete")
+
+    # --- LiDAR viewer launcher ---
+    def _launch_lidar_viewer(self):
+        """Launch LiDAR 3D viewer as a separate process.
+        
+        Open3D requires the main thread, so we run lidar_viewer_stage1.py
+        in a subprocess. It connects to the same CARLA server and creates
+        its own vehicle + LiDAR (independent from the driving system).
+        
+        For integrated viewing (reusing the ego vehicle's LiDAR), run
+        lidar_viewer.py manually in a second terminal.
+        """
+        import os
+        script = os.path.join(os.path.dirname(__file__), 'lidar_viewer_stage1.py')
+        if not os.path.exists(script):
+            print("⚠️ lidar_viewer_stage1.py not found!")
+            return
+        try:
+            import platform
+            if platform.system() == 'Windows':
+                subprocess.Popen(
+                    [sys.executable, script],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                )
+            else:
+                # Linux / macOS: start_new_session detaches the child process
+                subprocess.Popen(
+                    [sys.executable, script],
+                    start_new_session=True
+                )
+            print("✓ LiDAR 3D Viewer launched in new window")
+            print("  (Close that window or Ctrl+C in it to stop)")
+        except Exception as e:
+            print(f"⚠️ Failed to launch LiDAR viewer: {e}")
 
     # --- Day/Night helpers ---
     def set_night(self):
