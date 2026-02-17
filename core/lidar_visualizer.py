@@ -115,7 +115,7 @@ class LidarVisualizer:
 
     def create_window(self):
         """Create the Open3D window and register key callbacks. MUST call from main thread."""
-        self._vis = o3d.visualization.VisualizerWithKeyCallback(self.window_name)
+        self._vis = o3d.visualization.VisualizerWithKeyCallback()
         self._vis.create_window(
             window_name=self.window_name,
             width=self.width,
