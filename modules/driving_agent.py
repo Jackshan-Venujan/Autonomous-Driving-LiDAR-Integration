@@ -18,6 +18,7 @@ from modules.lane_detector import LaneDetector
 from modules.obstacle_detector import ObstacleDetector
 from modules.traffic_light_detector import TrafficLightDetector
 from modules.lead_vehicle_controller import LeadVehicleController
+from modules.lidar_based_obstacle_detector import LidarManager
 from core.pid_controller import PIDController
 from core.curvature_steering import CurvatureSteeringController
 from core.carla_spawner import CarlaSpawner
@@ -44,10 +45,13 @@ MAN_MAX_BRAKE = 1.00
 class DrivingAgent:
     """Autonomous driving agent with lane keeping and obstacle avoidance"""
     
-    def __init__(self, world: carla.World, vehicle: carla.Vehicle):
+    def __init__(self, world: carla.World, vehicle: carla.Vehicle, lidar_manager=None):
         """Initialize driving agent"""
         self.world = world
         self.vehicle = vehicle
+        
+        # LiDAR manager (Phase 1 — stream only, no fusion yet)
+        self.lidar_manager: LidarManager = lidar_manager
         
         # Initialize modules
         self.lane_detector = LaneDetector()

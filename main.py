@@ -9,6 +9,7 @@ import time
 import sys
 
 from modules.driving_agent import DrivingAgent
+from modules.lidar_based_obstacle_detector import LidarManager
 
 
 class AutonomousDrivingSystem:
@@ -65,10 +66,31 @@ class AutonomousDrivingSystem:
         self.camera_data = None
         self.camera.listen(lambda image: self._camera_callback(image))
         
-        # Initialize driving agent
-        self.agent = DrivingAgent(self.world, self.vehicle)
+        # ── Attach Standard LiDAR (Phase 1) ──────────────────────────────
+        # sensor.lidar.ray_cast — streams Nx4 point clouds via callback
+        # Config can be customized here; defaults: 32ch, 100m range, 600k pps
+        self.lidar_manager = LidarManager(
+            world=self.world,
+            vehicle=self.vehicle,
+            config={
+                'channels': 32,
+                'range': 100.0,
+                'points_per_second': 600000,
+                'rotation_frequency': 20.0,
+                'upper_fov': 10.0,
+                'lower_fov': -30.0,
+                'verbose': True,       # per-frame prints (set False to reduce spam)
+                'save_interval': 0,    # 0=off; set e.g. 200 to save every 200th frame
+                'watchdog_timeout': 5.0,
+                'stats_interval': 10.0,
+            },
+            auto_start=True,  # attach + listen immediately
+        )
         
-        print("✓ System initialized")
+        # Initialize driving agent (pass lidar_manager for future use)
+        self.agent = DrivingAgent(self.world, self.vehicle, lidar_manager=self.lidar_manager)
+        
+        print("✓ System initialized (with LiDAR)")
     
     def _camera_callback(self, image):
         """Camera callback - CARLA provides BGRA, convert to BGR for OpenCV"""
@@ -88,6 +110,7 @@ class AutonomousDrivingSystem:
         print("  [M] = Manual Mode")
         print("  [V] = Toggle Lane Mask Visualization")
         print("  [T] = Toggle Lead Vehicle (test your model!)")
+        print("  [P] = Print LiDAR Stats")
         print("  [N] = Night  [B] = Bright (Day)")
         print("  [W/A/S/D] = Manual throttle/brake/steering")
         print("  [Space] = Brake")
@@ -145,6 +168,10 @@ class AutonomousDrivingSystem:
                 elif key == ord('v'):
                     self.agent.toggle_lane_mask_visualization()
                 
+                # Print LiDAR throughput stats
+                elif key == ord('p'):
+                    self.lidar_manager.print_stats()
+                
                 # NEW: Toggle lead vehicle
                 elif key == ord('t'):
                     if self.agent.lead_vehicle.enabled:
@@ -177,6 +204,9 @@ class AutonomousDrivingSystem:
                 
                 if vis is not None:
                     cv2.imshow('Autonomous Driving - Modular', vis)
+                
+                # LiDAR periodic stats (auto-prints if interval elapsed)
+                self.lidar_manager.maybe_print_stats()
                 
                 # Status
                 if frame_count % 100 == 0:
@@ -217,6 +247,13 @@ class AutonomousDrivingSystem:
                 self.agent.cleanup()
         except Exception as e:
             print(f"   ⚠️ Error in agent cleanup: {e}")
+        
+        # 3b. Shutdown LiDAR sensor BEFORE vehicle
+        try:
+            if hasattr(self, 'lidar_manager') and self.lidar_manager is not None:
+                self.lidar_manager.shutdown()
+        except Exception as e:
+            print(f"   ⚠️ LiDAR cleanup error: {e}")
         
         # 4. Destroy camera BEFORE vehicle
         try:
