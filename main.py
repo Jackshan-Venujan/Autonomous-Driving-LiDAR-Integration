@@ -12,6 +12,9 @@ import subprocess
 from modules.driving_agent import DrivingAgent
 from modules.lidar_based_obstacle_detector import LidarManager
 
+# Shared file for LiDAR viewer IPC
+LIDAR_VIEWER_DATA_FILE = '/tmp/lidar_viewer_data.npz'
+
 
 class AutonomousDrivingSystem:
     """Main system coordinator"""
@@ -91,6 +94,10 @@ class AutonomousDrivingSystem:
         # Initialize driving agent (pass lidar_manager for future use)
         self.agent = DrivingAgent(self.world, self.vehicle, lidar_manager=self.lidar_manager)
         
+        # LiDAR 3D Viewer (separate Open3D window, lazy-initialized)
+        self.lidar_viewer_process = None
+        self.lidar_viewer_active = False
+        
         print("✓ System initialized (with LiDAR)")
     
     def _camera_callback(self, image):
@@ -112,7 +119,7 @@ class AutonomousDrivingSystem:
         print("  [V] = Toggle Lane Mask Visualization")
         print("  [T] = Toggle Lead Vehicle (test your model!)")
         print("  [P] = Print LiDAR Stats")
-        print("  [O] = Open LiDAR 3D Viewer (separate window, needs open3d)")
+        print("  [O] = Toggle LiDAR 3D Viewer (Open3D, shows ego vehicle's LiDAR)")
         print("  [N] = Night  [B] = Bright (Day)")
         print("  [W/A/S/D] = Manual throttle/brake/steering")
         print("  [Space] = Brake")
@@ -174,9 +181,9 @@ class AutonomousDrivingSystem:
                 elif key == ord('p'):
                     self.lidar_manager.print_stats()
                 
-                # Launch LiDAR 3D viewer in a separate process
+                # Toggle LiDAR 3D viewer (Open3D in separate process)
                 elif key == ord('o'):
-                    self._launch_lidar_viewer()
+                    self._toggle_lidar_viewer()
                 
                 # NEW: Toggle lead vehicle
                 elif key == ord('t'):
@@ -213,6 +220,16 @@ class AutonomousDrivingSystem:
                 
                 # LiDAR periodic stats (auto-prints if interval elapsed)
                 self.lidar_manager.maybe_print_stats()
+                
+                # Send LiDAR data to Open3D viewer (if active)
+                if self.lidar_viewer_active:
+                    lidar_data = self.lidar_manager.get_latest()
+                    if lidar_data is not None:
+                        self._write_lidar_data_for_viewer(
+                            lidar_data['points'],
+                            lidar_data['frame'],
+                            lidar_data['timestamp']
+                        )
                 
                 # Status
                 if frame_count % 100 == 0:
@@ -254,7 +271,20 @@ class AutonomousDrivingSystem:
         except Exception as e:
             print(f"   ⚠️ Error in agent cleanup: {e}")
         
-        # 3b. Shutdown LiDAR sensor BEFORE vehicle
+        # 3b. Stop LiDAR viewer FIRST (before LiDAR sensor)
+        try:
+            self.lidar_viewer_active = False
+            if hasattr(self, 'lidar_viewer_process') and self.lidar_viewer_process is not None:
+                self.lidar_viewer_process.terminate()
+                self.lidar_viewer_process = None
+            # Clean up shared file
+            import os
+            if os.path.exists(LIDAR_VIEWER_DATA_FILE):
+                os.remove(LIDAR_VIEWER_DATA_FILE)
+        except Exception as e:
+            print(f"   ⚠️ LiDAR viewer cleanup error: {e}")
+        
+        # 3c. Shutdown LiDAR sensor BEFORE vehicle
         try:
             if hasattr(self, 'lidar_manager') and self.lidar_manager is not None:
                 self.lidar_manager.shutdown()
@@ -279,39 +309,67 @@ class AutonomousDrivingSystem:
         
         print("✓ Cleanup complete")
 
-    # --- LiDAR viewer launcher ---
-    def _launch_lidar_viewer(self):
-        """Launch LiDAR 3D viewer as a separate process.
+    # --- LiDAR viewer toggle ---
+    def _toggle_lidar_viewer(self):
+        """Toggle Open3D LiDAR viewer (shared data from ego vehicle's LiDAR).
         
-        Open3D requires the main thread, so we run lidar_viewer_stage1.py
-        in a subprocess. It connects to the same CARLA server and creates
-        its own vehicle + LiDAR (independent from the driving system).
-        
-        For integrated viewing (reusing the ego vehicle's LiDAR), run
-        lidar_viewer.py manually in a second terminal.
+        Launches a separate Python script that reads LiDAR data from a shared file.
+        This approach avoids conflicts between OpenCV and Open3D GUI systems.
         """
         import os
-        script = os.path.join(os.path.dirname(__file__), 'lidar_viewer_stage1.py')
-        if not os.path.exists(script):
-            print("⚠️ lidar_viewer_stage1.py not found!")
-            return
-        try:
-            import platform
-            if platform.system() == 'Windows':
-                subprocess.Popen(
-                    [sys.executable, script],
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
-                )
+        
+        # Check if viewer process is still running
+        if self.lidar_viewer_process is not None:
+            poll = self.lidar_viewer_process.poll()
+            if poll is None:  # Still running
+                # Kill it
+                self.lidar_viewer_process.terminate()
+                self.lidar_viewer_process.wait(timeout=2)
+                self.lidar_viewer_process = None
+                self.lidar_viewer_active = False
+                # Clean up shared file
+                if os.path.exists(LIDAR_VIEWER_DATA_FILE):
+                    os.remove(LIDAR_VIEWER_DATA_FILE)
+                print("✓ LiDAR 3D Viewer stopped")
+                return
             else:
-                # Linux / macOS: start_new_session detaches the child process
-                subprocess.Popen(
-                    [sys.executable, script],
-                    start_new_session=True
-                )
-            print("✓ LiDAR 3D Viewer launched in new window")
-            print("  (Close that window or Ctrl+C in it to stop)")
+                # Process already exited
+                self.lidar_viewer_process = None
+                self.lidar_viewer_active = False
+        
+        # Start new viewer
+        script = os.path.join(os.path.dirname(__file__), 'core', 'lidar_viewer_script.py')
+        if not os.path.exists(script):
+            print(f"⚠️ Viewer script not found: {script}")
+            return
+        
+        try:
+            # Launch viewer as separate process
+            self.lidar_viewer_process = subprocess.Popen(
+                [sys.executable, script],
+                start_new_session=True,
+                stdout=None,  # Inherit stdout
+                stderr=None,  # Inherit stderr
+            )
+            self.lidar_viewer_active = True
+            print("✓ LiDAR 3D Viewer started")
+            print("  Controls: [1]intensity [2]height [G]ground [R]reset [+/-]size [Q]quit")
+            print("  Press [O] again to close")
         except Exception as e:
-            print(f"⚠️ Failed to launch LiDAR viewer: {e}")
+            print(f"⚠️ Failed to start LiDAR viewer: {e}")
+            self.lidar_viewer_process = None
+            self.lidar_viewer_active = False
+    
+    def _write_lidar_data_for_viewer(self, points, frame, timestamp):
+        """Write LiDAR data to shared file for the viewer to read."""
+        import numpy as np
+        try:
+            np.savez(LIDAR_VIEWER_DATA_FILE, 
+                     points=points, 
+                     frame=frame, 
+                     timestamp=timestamp)
+        except Exception:
+            pass  # Ignore write errors
 
     # --- Day/Night helpers ---
     def set_night(self):
