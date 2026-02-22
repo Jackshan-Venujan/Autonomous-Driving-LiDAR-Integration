@@ -77,14 +77,20 @@ class AutonomousDrivingSystem:
             world=self.world,
             vehicle=self.vehicle,
             config={
-                'channels': 32,
-                'range': 100.0,
-                'points_per_second': 600000,
-                'rotation_frequency': 20.0,
-                'upper_fov': 10.0,
-                'lower_fov': -30.0,
-                'verbose': True,       # per-frame prints (set False to reduce spam)
-                'save_interval': 0,    # 0=off; set e.g. 200 to save every 200th frame
+                # High-density 360° continuous scanning
+                'channels': 64,              # 64 vertical layers (was 32)
+                'range': 120.0,              # 120m range (was 100m)
+                'points_per_second': 1400000, # 1.4M points/sec (was 600k)
+                'rotation_frequency': 10.0,   # 10Hz = 140k pts/rotation (was 20Hz)
+                'upper_fov': 15.0,            # 15° above horizon (was 10°)
+                'lower_fov': -25.0,           # 25° below horizon (was -30°)
+                'sensor_tick': 0.0,           # Update every sim tick
+                'atmosphere_attenuation_rate': 0.004,  # Realistic attenuation
+                'dropoff_general_rate': 0.45,          # Point dropout rate
+                'dropoff_intensity_limit': 0.8,
+                'dropoff_zero_intensity': 0.4,
+                'verbose': False,             # Reduce spam with high density
+                'save_interval': 0,
                 'watchdog_timeout': 5.0,
                 'stats_interval': 10.0,
             },

@@ -34,13 +34,20 @@ from typing import Optional, Dict, Any
 
 LIDAR_CONFIG = {
     # Blueprint attributes (sensor.lidar.ray_cast)
-    'channels': 32,
-    'range': 100.0,                 # meters
-    'points_per_second': 600000,
-    'rotation_frequency': 20.0,     # Hz
-    'upper_fov': 10.0,              # degrees
-    'lower_fov': -30.0,             # degrees
-    'sensor_tick': 0.0,             # 0 = every sim tick
+    # High-density 360° continuous scanning configuration
+    'channels': 64,                 # 64 vertical layers for dense coverage
+    'range': 120.0,                 # meters (extended range)
+    'points_per_second': 1400000,   # 1.4M points/sec for dense cloud
+    'rotation_frequency': 10.0,     # Hz (10 rotations/sec = 140k pts/rotation)
+    'upper_fov': 15.0,              # degrees above horizon
+    'lower_fov': -25.0,             # degrees below horizon
+    'sensor_tick': 0.0,             # 0 = every sim tick (continuous)
+    
+    # Atmospheric effects for realism
+    'atmosphere_attenuation_rate': 0.004,
+    'dropoff_general_rate': 0.45,
+    'dropoff_intensity_limit': 0.8,
+    'dropoff_zero_intensity': 0.4,
 
     # Mounting transform (relative to vehicle origin)
     'location': {'x': 0.0, 'y': 0.0, 'z': 2.4},
@@ -237,6 +244,8 @@ class LidarManager:
         attr_keys = [
             'channels', 'range', 'points_per_second',
             'rotation_frequency', 'upper_fov', 'lower_fov', 'sensor_tick',
+            'atmosphere_attenuation_rate', 'dropoff_general_rate',
+            'dropoff_intensity_limit', 'dropoff_zero_intensity',
         ]
         for key in attr_keys:
             if key in self.config:
