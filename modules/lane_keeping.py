@@ -144,7 +144,7 @@ def main():
             vehicle.destroy()
             print("✓ Vehicle destroyed")
         except Exception as e:
-            print(f"⚠️ Cleanup error: {e}")
+            print(f" Cleanup error: {e}")
 
 
 if __name__ == "__main__":

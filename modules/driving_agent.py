@@ -18,6 +18,9 @@ from modules.lane_detector import LaneDetector
 from modules.obstacle_detector import ObstacleDetector
 from modules.traffic_light_detector import TrafficLightDetector
 from modules.lead_vehicle_controller import LeadVehicleController
+from modules.lane_keeping import CascadedLaneKeepingController  # Waypoint-based lane keeping
+from modules.mpc_trajectory_planner import MPCTrajectoryPlanner  # MPC-based trajectory planning
+from modules.decision_maker import DecisionMaker, DrivingBehavior  # Decision making for trajectory planning
 from core.pid_controller import PIDController
 from core.curvature_steering import CurvatureSteeringController
 from core.carla_spawner import CarlaSpawner
@@ -95,10 +98,34 @@ class DrivingAgent:
             wheelbase_m=2.9, k_p_lat=0.12, out_limit=STEER_LIMIT, rate_limit=0.03, ff_gain=1.0
         )
         
+        # NEW: Waypoint-based cascaded lane keeping controller (best for precise lane tracking)
+        self.lane_keeping_controller = CascadedLaneKeepingController(
+            lateral_kp=0.8, lateral_ki=0.0, lateral_kd=0.1,
+            heading_kp=1.5, heading_ki=0.0, heading_kd=0.2
+        )
+        self.last_lane_keeping_time = time.time()
+        
+        # NEW: MPC Trajectory Planner (optimized path following)
+        self.mpc_planner = MPCTrajectoryPlanner(
+            world=world,
+            horizon=10,      # 10 step prediction horizon
+            dt=0.1,          # 100ms per step
+            wheelbase=2.9    # Tesla Model 3 wheelbase
+        )
+        self.mpc_planner.set_target_speed(TARGET_SPEED)
+        self.mpc_enabled = True  # MPC availability flag
+        
+        # NEW: Decision Maker for high-level trajectory planning
+        self.decision_maker = DecisionMaker(world)
+        self.decision_maker.set_target_speed(TARGET_SPEED)
+        self.use_decision_maker = True  # Enable decision making
+        self.last_decision_info = {}  # Store last decision info
+        
         # State variables
         self.mode = 'manual'  # 'manual' or 'auto'
-        # self.controller_type = 'curvature'  # 'curvature' or 'pid'
-        self.controller_type = 'pid'
+        # Controller options: 'pid', 'curvature', 'lane_keeping', 'mpc', 'decision_mpc' (best)
+        self.controller_type = 'decision_mpc'  # DEFAULT: Decision Making + MPC
+        print(f"🎮 Controller: {self.controller_type}")
         self.target_speed = TARGET_SPEED
         self.gradual_stop_active = False
         self.emergency_stop_active = False  # NEW: For imminent collision
@@ -376,6 +403,14 @@ class DrivingAgent:
                 traffic_light_stop = True
                 traffic_light_decision = (tl_decision_text, tl_control_action, tl_brake_force)
         
+        # Store for decision maker (used by decision_mpc controller)
+        self.current_obstacles = lane_detections
+        # Extract traffic light state string from traffic_light_data dict
+        tl_state_str = None
+        if traffic_light_data and isinstance(traffic_light_data, dict):
+            tl_state_str = traffic_light_data.get('model_state') or traffic_light_data.get('state')
+        self.current_traffic_light_state = tl_state_str
+        
         control, decision = self._make_control_decision(
             lateral_error, obstacle_action, lane_lost, nearest_obstacle,
             traffic_light_stop, traffic_light_decision
@@ -541,99 +576,195 @@ class DrivingAgent:
                 control.steer = 0.0
         
         elif obstacle_action == 'slow':
-            # Active slowdown: reduce speed significantly
-            control.throttle = 0.0
-            if current_speed > 20:
-                control.brake = 0.5
-            elif current_speed > 15:
-                control.brake = 0.3
-            else:
-                control.brake = 0.15
-            # Maintain steering with smoothed input
-            if lateral_error is not None:
-                # Apply EMA smoothing
-                if self.lateral_error_ema is None:
-                    self.lateral_error_ema = lateral_error
-                else:
-                    self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
-                                             (1 - self.lateral_error_alpha) * self.lateral_error_ema)
-                smoothed_error = self.lateral_error_ema
+            # DECISION_MPC: Use decision maker for potential lane change instead of just slowing
+            if self.controller_type == 'decision_mpc':
+                obstacles = getattr(self, 'current_obstacles', [])
+                traffic_light_state = getattr(self, 'current_traffic_light_state', None)
+                lane_info = {
+                    'lanes_detected': self.last_lanes_detected,
+                    'lateral_error': lateral_error,
+                    'curvature': self.last_curvature
+                }
+                print(f"🔴 SLOW mode with {len(obstacles)} obstacles - checking lane change")
+                dm_steer, dm_throttle, dm_brake, dm_info = self._compute_decision_mpc_control(
+                    obstacles, traffic_light_state, lane_info
+                )
+                behavior = dm_info.get('behavior', 'lane_following')
                 
-                last_steer = self.steering_history[-1] if self.steering_history else None
-                if self.controller_type == 'curvature':
-                    control.steer = self.curv_controller.step(
-                        lane_detector=self.lane_detector,
-                        lateral_error_m=smoothed_error,
-                        speed_kmh=current_speed,
-                        last_out=last_steer
-                    )
+                # If decision maker wants lane change, use it
+                if behavior in ('lane_change_left', 'lane_change_right', 'obstacle_avoidance', 'overtaking'):
+                    print(f"✅ Lane change triggered: {behavior}")
+                    control.steer = dm_steer if dm_steer is not None else 0.0
+                    control.throttle = min(dm_throttle, 0.3) if dm_throttle else 0.0  # Limit speed during maneuver
+                    control.brake = dm_brake if dm_brake else 0.0
+                    decision = f"LANE_CHANGE: {behavior}"
+                    self.steering_history.append(control.steer)
                 else:
-                    control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
-                self.steering_history.append(control.steer)
+                    # Decision maker chose to follow/slow, apply standard slow logic
+                    control.throttle = 0.0
+                    if current_speed > 20:
+                        control.brake = 0.5
+                    elif current_speed > 15:
+                        control.brake = 0.3
+                    else:
+                        control.brake = 0.15
+                    if dm_steer is not None:
+                        control.steer = dm_steer
+                    else:
+                        control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
+                    self.steering_history.append(control.steer)
             else:
-                control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
+                # Non-decision_mpc: Active slowdown: reduce speed significantly
+                control.throttle = 0.0
+                if current_speed > 20:
+                    control.brake = 0.5
+                elif current_speed > 15:
+                    control.brake = 0.3
+                else:
+                    control.brake = 0.15
+                # Maintain steering with smoothed input
+                if lateral_error is not None:
+                    # Apply EMA smoothing
+                    if self.lateral_error_ema is None:
+                        self.lateral_error_ema = lateral_error
+                    else:
+                        self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
+                                                 (1 - self.lateral_error_alpha) * self.lateral_error_ema)
+                    smoothed_error = self.lateral_error_ema
+                    
+                    last_steer = self.steering_history[-1] if self.steering_history else None
+                    if self.controller_type == 'mpc':
+                        mpc_steer, mpc_throttle, mpc_brake = self._compute_mpc_control()
+                        if mpc_steer is not None:
+                            control.steer = mpc_steer
+                            # MPC provides throttle/brake but in slow mode we limit it
+                            control.throttle = min(mpc_throttle or 0.0, 0.15)
+                        else:
+                            control.steer = last_steer * 0.95 if last_steer else 0.0
+                    elif self.controller_type == 'lane_keeping':
+                        lk_steer = self._compute_lane_keeping_steer()
+                        control.steer = lk_steer if lk_steer is not None else (last_steer * 0.95 if last_steer else 0.0)
+                    elif self.controller_type == 'curvature':
+                        control.steer = self.curv_controller.step(
+                            lane_detector=self.lane_detector,
+                            lateral_error_m=smoothed_error,
+                            speed_kmh=current_speed,
+                            last_out=last_steer
+                        )
+                    else:
+                        control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
+                    self.steering_history.append(control.steer)
+                else:
+                    control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
         
         elif obstacle_action == 'cautious':
-            # Cautious mode: gentle deceleration, reduce target speed
-            reduced_target = min(self.target_speed * 0.6, 20.0)  # Max 20 km/h in cautious mode
-            speed_err = reduced_target - current_speed
-            
-            if speed_err < -2:
-                control.throttle = 0.0
-                control.brake = 0.2
-            elif speed_err < 0:
-                control.throttle = 0.0
-                control.brake = 0.0
-            else:
-                control.throttle = 0.2
-                control.brake = 0.0
-            
-            # Maintain steering with smoothed input
-            if lateral_error is not None:
-                # Apply EMA smoothing
-                if self.lateral_error_ema is None:
-                    self.lateral_error_ema = lateral_error
-                else:
-                    self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
-                                             (1 - self.lateral_error_alpha) * self.lateral_error_ema)
-                smoothed_error = self.lateral_error_ema
+            # DECISION_MPC: Use decision maker for potential lane change
+            if self.controller_type == 'decision_mpc':
+                obstacles = getattr(self, 'current_obstacles', [])
+                traffic_light_state = getattr(self, 'current_traffic_light_state', None)
+                lane_info = {
+                    'lanes_detected': self.last_lanes_detected,
+                    'lateral_error': lateral_error,
+                    'curvature': self.last_curvature
+                }
+                print(f"🟡 CAUTIOUS mode with {len(obstacles)} obstacles - checking lane change")
+                dm_steer, dm_throttle, dm_brake, dm_info = self._compute_decision_mpc_control(
+                    obstacles, traffic_light_state, lane_info
+                )
+                behavior = dm_info.get('behavior', 'lane_following')
                 
-                last_steer = self.steering_history[-1] if self.steering_history else None
-                if self.controller_type == 'curvature':
-                    control.steer = self.curv_controller.step(
-                        lane_detector=self.lane_detector,
-                        lateral_error_m=smoothed_error,
-                        speed_kmh=current_speed,
-                        last_out=last_steer
-                    )
+                # If decision maker wants lane change, use it
+                if behavior in ('lane_change_left', 'lane_change_right', 'obstacle_avoidance', 'overtaking'):
+                    print(f"✅ Lane change triggered: {behavior}")
+                    control.steer = dm_steer if dm_steer is not None else 0.0
+                    control.throttle = min(dm_throttle, 0.25) if dm_throttle else 0.15  # Limited speed
+                    control.brake = dm_brake if dm_brake else 0.0
+                    decision = f"LANE_CHANGE: {behavior}"
+                    self.steering_history.append(control.steer)
                 else:
-                    control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
-                self.steering_history.append(control.steer)
+                    # Decision maker chose to follow, apply cautious logic
+                    reduced_target = min(self.target_speed * 0.6, 20.0)
+                    speed_err = reduced_target - current_speed
+                    if speed_err < -2:
+                        control.throttle = 0.0
+                        control.brake = 0.2
+                    elif speed_err < 0:
+                        control.throttle = 0.0
+                        control.brake = 0.0
+                    else:
+                        control.throttle = 0.2
+                        control.brake = 0.0
+                    if dm_steer is not None:
+                        control.steer = dm_steer
+                    else:
+                        control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
+                    self.steering_history.append(control.steer)
             else:
-                control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
+                # Non-decision_mpc: Cautious mode: gentle deceleration, reduce target speed
+                reduced_target = min(self.target_speed * 0.6, 20.0)  # Max 20 km/h in cautious mode
+                speed_err = reduced_target - current_speed
+                
+                if speed_err < -2:
+                    control.throttle = 0.0
+                    control.brake = 0.2
+                elif speed_err < 0:
+                    control.throttle = 0.0
+                    control.brake = 0.0
+                else:
+                    control.throttle = 0.2
+                    control.brake = 0.0
+                
+                # Maintain steering with smoothed input
+                if lateral_error is not None:
+                    # Apply EMA smoothing
+                    if self.lateral_error_ema is None:
+                        self.lateral_error_ema = lateral_error
+                    else:
+                        self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
+                                                 (1 - self.lateral_error_alpha) * self.lateral_error_ema)
+                    smoothed_error = self.lateral_error_ema
+                    
+                    last_steer = self.steering_history[-1] if self.steering_history else None
+                    if self.controller_type == 'mpc':
+                        mpc_steer, mpc_throttle, mpc_brake = self._compute_mpc_control()
+                        if mpc_steer is not None:
+                            control.steer = mpc_steer
+                            # MPC provides throttle/brake but in cautious mode we limit it
+                            control.throttle = min(mpc_throttle or 0.0, 0.2)
+                        else:
+                            control.steer = last_steer * 0.95 if last_steer else 0.0
+                    elif self.controller_type == 'lane_keeping':
+                        lk_steer = self._compute_lane_keeping_steer()
+                        control.steer = lk_steer if lk_steer is not None else (last_steer * 0.95 if last_steer else 0.0)
+                    elif self.controller_type == 'curvature':
+                        control.steer = self.curv_controller.step(
+                            lane_detector=self.lane_detector,
+                            lateral_error_m=smoothed_error,
+                            speed_kmh=current_speed,
+                            last_out=last_steer
+                        )
+                    else:
+                        control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
+                    self.steering_history.append(control.steer)
+                else:
+                    control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
         
         else:
             # Normal driving (obstacle_action == 'drive')
-            # Normal driving
+            
             # Adaptive target speed based on curvature (if available)
             kappa, kappa_cls = self.lane_detector.compute_centerline_curvature()
-            # Updated speed policy:
-            # straight: 30 km/h
-            # gentle: 28 km/h
-            # moderate: 26 km/h
-            # sharp: 25 km/h
-            # very_sharp: 18 km/h (tight bend safety)
             if kappa is not None and kappa_cls is not None:
                 if kappa_cls == 'straight':
                     dyn_target = 30.0
                 elif kappa_cls == 'gentle':
-                    dyn_target = 30.0
+                    dyn_target = 28.0
                 elif kappa_cls == 'moderate':
-                    dyn_target = 30.0
+                    dyn_target = 26.0
                 elif kappa_cls == 'sharp':
-                    dyn_target = 30.0
+                    dyn_target = 22.0
                 else:  # very_sharp
-                    dyn_target = 30.0
+                    dyn_target = 18.0
             else:
                 dyn_target = 30.0  # unknown curvature fallback
 
@@ -642,56 +773,133 @@ class DrivingAgent:
                 dyn_target = min(dyn_target, 12.0)
             elif self.last_lanes_detected == 1:     # single lane
                 dyn_target = min(dyn_target, 15.0)
-            # (2+ lanes -> keep dyn_target)
             self.target_speed = dyn_target
-
-            # Speed control toward dynamic target
-            # Smoother speed control bands to reduce jerking
-            speed_err = self.target_speed - current_speed
-            if speed_err > 8:
-                control.throttle, control.brake = 0.5, 0.0
-            elif speed_err > 4:
-                control.throttle, control.brake = 0.35, 0.0
-            elif speed_err > 1:
-                control.throttle, control.brake = 0.22, 0.0
-            elif speed_err < -5:
-                control.throttle, control.brake = 0.0, 0.25
-            elif speed_err < -2:
-                control.throttle, control.brake = 0.0, 0.12
-            else:
-                control.throttle, control.brake = 0.18, 0.0
             
-            # Steering control (prefer map-based when lanes weak)
-            use_map_fallback = (self.last_lanes_detected <= 1)
-            map_steer = self._map_based_steer(lookahead_m=12.0) if use_map_fallback else None
-            if map_steer is not None:
-                control.steer = map_steer
-            else:
-                # Apply EMA smoothing to lateral error to reduce steering jerk
-                if lateral_error is not None:
-                    if self.lateral_error_ema is None:
-                        self.lateral_error_ema = lateral_error
-                    else:
-                        self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
-                                                 (1 - self.lateral_error_alpha) * self.lateral_error_ema)
-                    smoothed_error = self.lateral_error_ema
-                else:
-                    smoothed_error = None
+            # Update MPC target speed
+            if self.controller_type in ('mpc', 'decision_mpc'):
+                self.mpc_planner.set_target_speed(self.target_speed)
+            
+            # Controller-specific control
+            last_steer = self.steering_history[-1] if self.steering_history else None
+            
+            if self.controller_type == 'decision_mpc':
+                # Decision-making MPC: High-level behavior + trajectory planning
+                obstacles = getattr(self, 'current_obstacles', [])
+                traffic_light_state = getattr(self, 'current_traffic_light_state', None)
+                lane_info = {
+                    'lanes_detected': self.last_lanes_detected,
+                    'lateral_error': lateral_error,
+                    'curvature': self.last_curvature
+                }
                 
-                last_steer = self.steering_history[-1] if self.steering_history else None
-                if self.controller_type == 'curvature':
-                    control.steer = self.curv_controller.step(
-                        lane_detector=self.lane_detector,
-                        lateral_error_m=smoothed_error,
-                        speed_kmh=current_speed,
-                        last_out=last_steer
-                    )
+                # Debug: Show obstacles detected
+                if obstacles:
+                    print(f"🚧 Obstacles: {len(obstacles)} detected")
+                    for obs in obstacles[:3]:  # Show first 3
+                        print(f"   - {obs.get('class')}: {obs.get('distance', '?'):.1f}m, danger={obs.get('danger_level')}")
+                
+                dm_steer, dm_throttle, dm_brake, dm_info = self._compute_decision_mpc_control(
+                    obstacles, traffic_light_state, lane_info
+                )
+                if dm_steer is not None:
+                    control.steer = dm_steer
+                    control.throttle = dm_throttle
+                    control.brake = dm_brake
+                    # Store decision info for logging/debugging
+                    decision['decision_info'] = dm_info
+                    
+                    # Debug: Show decision info
+                    behavior = dm_info.get('behavior', 'unknown')
+                    using_ext = dm_info.get('using_external_trajectory', False)
+                    if using_ext or behavior != 'lane_following':
+                        print(f"✅ Decision: {behavior}, ext_traj={using_ext}")
                 else:
-                    # PID with smoothed lateral error for reduced jerk
-                    if smoothed_error is not None:
-                        control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
+                    print("⚠️ Decision MPC returned None, falling back")
+                    # Fallback to regular MPC
+                    mpc_steer, mpc_throttle, mpc_brake = self._compute_mpc_control()
+                    if mpc_steer is not None:
+                        control.steer = mpc_steer
+                        control.throttle = mpc_throttle or 0.0
+                        control.brake = mpc_brake or 0.0
                     else:
-                        control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
+                        lk_steer = self._compute_lane_keeping_steer()
+                        control.steer = lk_steer if lk_steer is not None else (last_steer * 0.95 if last_steer else 0.0)
+                        control.throttle, control.brake = 0.2, 0.0
+                        
+            elif self.controller_type == 'mpc':
+                # MPC handles BOTH steering AND throttle/brake optimally
+                mpc_steer, mpc_throttle, mpc_brake = self._compute_mpc_control()
+                if mpc_steer is not None:
+                    control.steer = mpc_steer
+                    control.throttle = mpc_throttle or 0.0
+                    control.brake = mpc_brake or 0.0
+                else:
+                    # Fallback to lane keeping + manual speed control if MPC fails
+                    lk_steer = self._compute_lane_keeping_steer()
+                    control.steer = lk_steer if lk_steer is not None else (last_steer * 0.95 if last_steer else 0.0)
+                    # Fallback speed control
+                    current_speed = self._get_vehicle_speed()
+                    speed_err = self.target_speed - current_speed
+                    if speed_err > 4:
+                        control.throttle, control.brake = 0.4, 0.0
+                    elif speed_err > 1:
+                        control.throttle, control.brake = 0.25, 0.0
+                    elif speed_err < -3:
+                        control.throttle, control.brake = 0.0, 0.2
+                    else:
+                        control.throttle, control.brake = 0.2, 0.0
+            else:
+                # Non-MPC controllers: Use traditional speed control
+                current_speed = self._get_vehicle_speed()
+                speed_err = self.target_speed - current_speed
+                if speed_err > 8:
+                    control.throttle, control.brake = 0.5, 0.0
+                elif speed_err > 4:
+                    control.throttle, control.brake = 0.35, 0.0
+                elif speed_err > 1:
+                    control.throttle, control.brake = 0.22, 0.0
+                elif speed_err < -5:
+                    control.throttle, control.brake = 0.0, 0.25
+                elif speed_err < -2:
+                    control.throttle, control.brake = 0.0, 0.12
+                else:
+                    control.throttle, control.brake = 0.18, 0.0
+                
+                # Steering control
+                use_map_fallback = (self.last_lanes_detected <= 1)
+                map_steer = self._map_based_steer(lookahead_m=12.0) if use_map_fallback else None
+                
+                if map_steer is not None:
+                    control.steer = map_steer
+                else:
+                    # Apply EMA smoothing to lateral error
+                    if lateral_error is not None:
+                        if self.lateral_error_ema is None:
+                            self.lateral_error_ema = lateral_error
+                        else:
+                            self.lateral_error_ema = (self.lateral_error_alpha * lateral_error + 
+                                                     (1 - self.lateral_error_alpha) * self.lateral_error_ema)
+                        smoothed_error = self.lateral_error_ema
+                    else:
+                        smoothed_error = None
+                    
+                    if self.controller_type == 'lane_keeping':
+                        lk_steer = self._compute_lane_keeping_steer()
+                        control.steer = lk_steer if lk_steer is not None else (last_steer * 0.95 if last_steer else 0.0)
+                    elif self.controller_type == 'curvature':
+                        control.steer = self.curv_controller.step(
+                            lane_detector=self.lane_detector,
+                            lateral_error_m=smoothed_error,
+                            speed_kmh=current_speed,
+                            last_out=last_steer
+                        )
+                    else:
+                        # PID with smoothed lateral error
+                        if smoothed_error is not None:
+                            control.steer = self.pid_controller.step(smoothed_error, last_out=last_steer)
+                        else:
+                            control.steer = self.steering_history[-1] * 0.95 if self.steering_history else 0.0
+            
             self.steering_history.append(control.steer)
         
         return control, decision
@@ -737,6 +945,155 @@ class DrivingAgent:
             return float(steer)
         except Exception:
             return None
+    
+    def _compute_lane_keeping_steer(self) -> Optional[float]:
+        """Compute steering using waypoint-based cascaded lane keeping controller.
+        This provides precise lane tracking by using CARLA's HD map waypoints.
+        Returns steering value in [-1.0, 1.0] or None on failure.
+        """
+        try:
+            world_map = self.world.get_map()
+            if world_map is None:
+                return None
+            
+            vehicle_transform = self.vehicle.get_transform()
+            waypoint = world_map.get_waypoint(
+                vehicle_transform.location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving
+            )
+            if waypoint is None:
+                return None
+            
+            # Compute dt from last call
+            current_time = time.time()
+            dt = current_time - self.last_lane_keeping_time
+            self.last_lane_keeping_time = current_time
+            dt = max(0.001, min(dt, 0.1))  # Clamp dt to reasonable range
+            
+            steer = self.lane_keeping_controller.compute_steering(
+                vehicle_transform,
+                waypoint.transform,
+                dt
+            )
+            return float(steer)
+        except Exception:
+            return None
+    
+    def _compute_mpc_control(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Compute steering, throttle, and brake using MPC trajectory planner.
+        Returns (steering, throttle, brake) or (None, None, None) on failure.
+        """
+        try:
+            if not self.mpc_enabled:
+                return None, None, None
+            
+            # Update MPC target speed
+            self.mpc_planner.set_target_speed(self.target_speed)
+            
+            # Compute optimal control
+            steering, throttle_brake, info = self.mpc_planner.compute_control(self.vehicle)
+            
+            if info.get('success', False):
+                # Convert throttle_brake to separate throttle and brake
+                if throttle_brake >= 0:
+                    throttle = float(throttle_brake)
+                    brake = 0.0
+                else:
+                    throttle = 0.0
+                    brake = float(-throttle_brake)
+                
+                return float(steering), throttle, brake
+            else:
+                return None, None, None
+        except Exception as e:
+            print(f"⚠️ MPC error: {e}")
+            return None, None, None
+    
+    def _compute_decision_mpc_control(self, 
+                                       obstacles: list = None,
+                                       traffic_light_state = None,
+                                       lane_info: Optional[Dict] = None) -> Tuple[Optional[float], Optional[float], Optional[float], Dict]:
+        """
+        Compute control using Decision Making + MPC.
+        High-level decisions (lane change, stop, follow) + MPC trajectory optimization.
+        
+        Returns (steering, throttle, brake, decision_info) or (None, None, None, {}) on failure.
+        """
+        try:
+            if not self.use_decision_maker:
+                return None, None, None, {}
+            
+            # Make high-level decision
+            trajectory, decision_info = self.decision_maker.decide(
+                self.vehicle,
+                obstacles=obstacles,
+                traffic_light=traffic_light_state,
+                lane_info=lane_info
+            )
+            
+            self.last_decision_info = decision_info
+            
+            # Handle emergency behaviors directly
+            behavior = self.decision_maker.current_behavior
+            
+            if behavior == DrivingBehavior.EMERGENCY_STOP:
+                return 0.0, 0.0, 1.0, decision_info
+            
+            if behavior == DrivingBehavior.TRAFFIC_LIGHT_STOP:
+                speed = self._get_vehicle_speed()
+                if speed < 1.0:
+                    return 0.0, 0.0, 0.5, decision_info
+                else:
+                    return 0.0, 0.0, 0.6, decision_info
+            
+            # Update MPC with decision's target speed
+            target_speed_ms = 8.33  # Default 30 km/h
+            if trajectory and trajectory.target_speed is not None:
+                target_speed_ms = trajectory.target_speed
+                self.mpc_planner.set_target_speed(target_speed_ms * 3.6)  # Convert to km/h
+            
+            # CRITICAL: Pass decision maker's trajectory to MPC for lane change/avoidance
+            external_waypoints = None
+            if trajectory and trajectory.waypoints and len(trajectory.waypoints) >= 3:
+                # Only use external waypoints for non-lane-following behaviors
+                if behavior in (DrivingBehavior.LANE_CHANGE_LEFT, 
+                               DrivingBehavior.LANE_CHANGE_RIGHT,
+                               DrivingBehavior.OBSTACLE_AVOIDANCE,
+                               DrivingBehavior.OVERTAKING):
+                    external_waypoints = trajectory.waypoints
+                    decision_info['using_external_trajectory'] = True
+                    decision_info['trajectory_behavior'] = behavior.value
+            
+            # Use MPC for trajectory tracking with decision maker's waypoints
+            steering, throttle_brake, mpc_info = self.mpc_planner.compute_control(
+                self.vehicle,
+                external_waypoints=external_waypoints,
+                external_target_speed=target_speed_ms
+            )
+            
+            # Merge decision info
+            decision_info.update(mpc_info)
+            
+            if steering is not None:
+                if throttle_brake >= 0:
+                    throttle = float(throttle_brake)
+                    brake = 0.0
+                else:
+                    throttle = 0.0
+                    brake = float(-throttle_brake)
+                
+                return float(steering), throttle, brake, decision_info
+            else:
+                # Fallback to lane keeping
+                lk_steer = self._compute_lane_keeping_steer()
+                return lk_steer or 0.0, 0.2, 0.0, decision_info
+                
+        except Exception as e:
+            print(f"⚠️ Decision MPC error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None, None, {}
     
     def _emergency_stop(self) -> Dict:
         """Emergency stop"""
