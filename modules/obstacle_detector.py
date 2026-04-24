@@ -55,11 +55,57 @@ class ObstacleDetector:
         # Lane filtering
         self.lane_mask = None
         self.lane_polygon = None
-        
+
+        # Stereo depth estimator — wired in later via set_stereo_estimator().
+        # Default is None so the existing pinhole formula is used unchanged
+        # until a stereo estimator is explicitly connected.
+        self._stereo_estimator = None
+        self._stereo_count     = 0   # detections via stereo this frame
+        self._pinhole_count    = 0   # detections via pinhole this frame
+
         print(f"✓ Obstacle Detector initialized")
         print(f"  Model: {model_path}")
         print(f"  Base stop distance: {self.base_stop_distance}m (speed-adaptive)")
     
+    def set_stereo_estimator(self, estimator) -> None:
+        """
+        Connects a StereoDepthEstimator to this detector.
+
+        Once connected, detect() will use stereo depth for each bounding
+        box where stereo data is available. If no stereo data exists for
+        a box (e.g. texture-less surface), the pinhole formula is used
+        as a fallback automatically.
+
+        Args:
+            estimator: A StereoDepthEstimator instance, or None to
+                       disconnect and revert to pinhole-only mode.
+        """
+        self._stereo_estimator = estimator
+        state = "connected" if estimator is not None else "disconnected"
+        print(f"  ✓ Stereo estimator {state}")
+
+    def _get_stereo_distance(self,
+                             x1: int, y1: int,
+                             x2: int, y2: int) -> Optional[float]:
+        """
+        Queries the stereo estimator for the depth inside a bounding box.
+
+        Returns None if:
+          - No stereo estimator is connected (self._stereo_estimator is None)
+          - The estimator has not computed a depth map yet this frame
+          - There are too few valid stereo pixels inside the bounding box
+            (e.g. the object surface has little texture for SGBM to match)
+
+        Args:
+            x1, y1, x2, y2: Bounding box pixel coordinates.
+
+        Returns:
+            Depth in metres, or None.
+        """
+        if self._stereo_estimator is None:
+            return None
+        return self._stereo_estimator.get_depth_at_bbox(x1, y1, x2, y2)
+
     def get_speed_adaptive_thresholds(self, vehicle_speed_kmh: float) -> Dict[str, float]:
         """
         Calculate speed-adaptive safety distances
@@ -99,29 +145,50 @@ class ObstacleDetector:
             image: Input image
             vehicle_speed_kmh: Current vehicle speed for adaptive thresholds
         """
+        # Reset per-frame counters so the HUD shows current-frame stats.
+        self._stereo_count  = 0
+        self._pinhole_count = 0
+
         results = self.model(image, conf=self.conf_threshold, verbose=False)
-        
+
         # Get speed-adaptive thresholds
         thresholds = self.get_speed_adaptive_thresholds(vehicle_speed_kmh)
-        
+
         detections = []
-        
+
         for result in results:
             boxes = result.boxes
-            
+
             for box in boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 confidence = float(box.conf[0])
-                class_id = int(box.cls[0])
+                class_id   = int(box.cls[0])
                 class_name = self.model.names[class_id]
-                
+
                 bbox_height = y2 - y1
-                distance = self._estimate_distance(bbox_height, class_name)
-                
+                distance    = self._estimate_distance(bbox_height, class_name)
+
+                # ── Stereo depth override (non-breaking) ──────────────────
+                # Try to get a more accurate distance from stereo depth map.
+                # If stereo gives a valid result → use it (source='stereo').
+                # If not → keep the pinhole value already computed (source='pinhole').
+                # This block does nothing when _stereo_estimator is None.
+                stereo_dist = self._get_stereo_distance(
+                    int(x1), int(y1), int(x2), int(y2)
+                )
+                if stereo_dist is not None and 0.5 < stereo_dist < 150.0:
+                    distance         = stereo_dist   # use stereo for danger-level calc too
+                    distance_source  = 'stereo'
+                    self._stereo_count += 1
+                else:
+                    distance_source  = 'pinhole'
+                    self._pinhole_count += 1
+                # ──────────────────────────────────────────────────────────
+
                 # Determine danger level based on speed-adaptive thresholds
                 danger_level = 'safe'
                 is_dangerous = False
-                
+
                 if distance is not None:
                     if distance <= thresholds['emergency_stop']:
                         danger_level = 'emergency'
@@ -133,23 +200,42 @@ class ObstacleDetector:
                         danger_level = 'warning'
                     elif distance <= thresholds['slowdown']:
                         danger_level = 'slowdown'
-                
+
                 detection = {
-                    'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                    'confidence': confidence,
-                    'class': class_name,
-                    'class_id': class_id,
-                    'distance': distance,
-                    'is_dangerous': is_dangerous,
-                    'danger_level': danger_level,
-                    'bbox_center': (int((x1 + x2) / 2), int((y1 + y2) / 2)),
-                    'in_lane': False
+                    'bbox':            (int(x1), int(y1), int(x2), int(y2)),
+                    'confidence':      confidence,
+                    'class':           class_name,
+                    'class_id':        class_id,
+                    'distance':        distance,
+                    'distance_source': distance_source,
+                    'is_dangerous':    is_dangerous,
+                    'danger_level':    danger_level,
+                    'bbox_center':     (int((x1 + x2) / 2), int((y1 + y2) / 2)),
+                    'in_lane':         False
                 }
-                
+
                 detections.append(detection)
-        
+
         annotated = results[0].plot() if len(results) > 0 else image.copy()
-        
+
+        # ── HUD overlays on the annotated image ───────────────────────────
+        # Top-left: how many boxes used stereo vs pinhole this frame.
+        cv2.putText(annotated,
+                    f"S:{self._stereo_count}  P:{self._pinhole_count}",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Bottom-left: whether the stereo estimator is connected.
+        if self._stereo_estimator is not None:
+            stereo_label  = "STEREO: ACTIVE"
+            stereo_colour = (0, 200, 0)    # green
+        else:
+            stereo_label  = "STEREO: INACTIVE"
+            stereo_colour = (0, 0, 200)    # red
+        cv2.putText(annotated, stereo_label,
+                    (10, annotated.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, stereo_colour, 2)
+        # ──────────────────────────────────────────────────────────────────
+
         return detections, annotated
     
     def filter_by_lane(self, detections: List[Dict], filtered_lanes: List, 
@@ -343,15 +429,20 @@ class ObstacleDetector:
             danger_level = det.get('danger_level', 'safe')
             in_lane = det.get('in_lane', False)
             
-            # Color based on danger level
+            # Color based on danger level.
+            # For dangerous objects the safety colour always takes priority.
+            # For safe objects: GREEN = stereo-measured (geometry-based, accurate)
+            #                   YELLOW = pinhole fallback (height-based estimate)
+            src = det.get('distance_source', 'pinhole')
             color_map = {
-                'emergency': (0, 0, 255),      # Red - immediate danger
-                'stop': (0, 69, 255),          # Orange-Red - must stop
-                'warning': (0, 165, 255),      # Orange - slow down
-                'slowdown': (0, 255, 255),     # Yellow - be cautious
-                'safe': (0, 255, 0)            # Green - safe
+                'emergency': (0, 0, 255),      # Red         — immediate danger
+                'stop':      (0, 69, 255),     # Orange-Red  — must stop
+                'warning':   (0, 165, 255),    # Orange      — slow down
+                'slowdown':  (0, 255, 255),    # Yellow      — be cautious
+                'safe':      (0, 255, 0) if src == 'stereo' else (0, 255, 255)
+                #            Green (stereo)    vs  Yellow (pinhole)
             }
-            
+
             color = color_map.get(danger_level, (0, 255, 0))
             
             # Thicker border for dangerous objects in lane

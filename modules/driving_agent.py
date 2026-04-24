@@ -24,6 +24,8 @@ from core.carla_spawner import CarlaSpawner
 
 # UPDATED: Import from detection module
 from detection.yolo_lane_filter import YOLOLaneFilter
+from modules.stereo_depth_estimator import StereoDepthEstimator
+from modules.lidar_distance_estimator import LidarDistanceEstimator
 
 # Control parameters - Tuned for smooth steering at 15 km/h
 PID_KP, PID_KI, PID_KD = 0.45, 0.015, 0.28  # Lower P, higher D for smoother response
@@ -78,10 +80,30 @@ class DrivingAgent:
         # self.traffic_light_detector.roi_right_ratio = 0.8    # Right: 75% from left
         # self.traffic_light_detector.zoom_scale = 1.75        # Zoom factor
         
+        # Stereo depth estimator — computes per-pixel depth from left+right
+        # camera frames. Connected to obstacle_detector so it uses stereo
+        # depth for bounding box distances instead of the pinhole formula.
+        # Camera parameters match the spawned left camera in main.py.
+        self.stereo_estimator = StereoDepthEstimator(
+            image_width  = self.lane_detector.img_w,
+            image_height = self.lane_detector.img_h,
+            fov_degrees  = 90.0,
+            baseline_m   = 0.54
+        )
+        self.obstacle_detector.set_stereo_estimator(self.stereo_estimator)
+        self.stereo_active = False   # set True each frame a right frame arrives
+
+        # LiDAR distance estimator — lightweight module for distance measurement.
+        # Full LiDAR integration into the driving decision loop is a separate task.
+        # Here we instantiate it so the evaluation script can call it each frame.
+        self.lidar_estimator    = LidarDistanceEstimator()
+        self.lidar_active       = False         # set True when lidar_data is received
+        self._last_lidar_data   = None          # raw point cloud, accessed by eval script
+
         # Calibrate obstacle detector
         self.obstacle_detector.calibrate_camera(
-            self.lane_detector.img_w, 
-            self.lane_detector.img_h, 
+            self.lane_detector.img_w,
+            self.lane_detector.img_h,
             fov_degrees=90
         )
         
@@ -257,9 +279,45 @@ class DrivingAgent:
         control.reverse = bool(self.manual_reverse)
         return control
     
-    def process_frame(self, image):
-        """Process single frame and return control decision"""
-        
+    def process_frame(self,
+                      frame:       np.ndarray,
+                      right_frame: np.ndarray = None,
+                      lidar_data:  np.ndarray = None) -> dict:
+        """Process single frame and return control decision.
+
+        Args:
+            frame:       BGR image from the LEFT (main) camera.
+            right_frame: BGR image from the RIGHT camera, or None.
+                         Defaults to None — existing call sites with one
+                         argument continue to work unchanged.
+            lidar_data:  LiDAR point cloud array (N, 4) or None.
+                         Stored on the agent so the evaluation script can
+                         access it without changing the driving logic.
+        """
+        # Use 'image' internally so nothing else in this method needs changing.
+        image = frame
+
+        # ── Stereo depth update ───────────────────────────────────────────
+        # If a right frame was provided this tick, compute the stereo depth
+        # map so that obstacle_detector can use it for each bounding box.
+        # Must be called BEFORE detect() so the depth map is fresh.
+        if right_frame is not None:
+            self.stereo_estimator.compute(frame, right_frame)
+            self.stereo_active = True
+        else:
+            self.stereo_active = False
+        # ─────────────────────────────────────────────────────────────────
+
+        # ── LiDAR data passthrough ────────────────────────────────────────
+        # Store the latest point cloud so evaluate_all_methods.py can
+        # retrieve it via agent._last_lidar_data each tick.
+        # We check len() > 100 to skip the very first sparse frames the
+        # sensor emits before it reaches full rotation speed.
+        self._last_lidar_data = lidar_data
+        self.lidar_active     = (lidar_data is not None
+                                 and len(lidar_data) > 100)
+        # ─────────────────────────────────────────────────────────────────
+
         # Update lead vehicle (if enabled)
         self.lead_vehicle.update()
         
@@ -305,6 +363,8 @@ class DrivingAgent:
                     'should_stop': False
                 },
                 'traffic_light_data': traffic_light_data,
+                'stereo_active': self.stereo_active,
+                'lidar_active':  self.lidar_active,
                 'decision': 'MANUAL CONTROL'
             }
         
@@ -313,6 +373,8 @@ class DrivingAgent:
         if lane_result is None:
             result = self._emergency_stop()
             result['traffic_light_data'] = traffic_light_data
+            result['stereo_active']      = self.stereo_active
+            result['lidar_active']       = self.lidar_active
             return result
         # Update lane count for speed policy
         self.last_lanes_detected = lane_result.get('lanes_detected', 0)
@@ -396,6 +458,8 @@ class DrivingAgent:
                 'obstacle_action': obstacle_action
             },
             'traffic_light_data': traffic_light_data,
+            'stereo_active': self.stereo_active,
+            'lidar_active':  self.lidar_active,
             'decision': decision
         }
     
@@ -888,8 +952,22 @@ class DrivingAgent:
             cv2.putText(vis, f"Lead Vehicle: {lead_status['distance']:.1f}m @ {lead_status['speed']:.1f} km/h", 
                        (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 255), 2)
         
+        # Stereo depth status — shows whether the right camera is feeding data
+        stereo_active  = result.get('stereo_active', False)
+        status_text    = "STEREO: ACTIVE"   if stereo_active else "STEREO: INACTIVE"
+        status_colour  = (0, 200, 0)        if stereo_active else (0, 0, 200)
+        cv2.putText(vis, status_text, (10, 270),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_colour, 2)
+
+        # LiDAR status — shows whether the point cloud is being received
+        lidar_active   = result.get('lidar_active', False)
+        lidar_text     = "LIDAR: ACTIVE"    if lidar_active else "LIDAR: INACTIVE"
+        lidar_colour   = (0, 200, 0)        if lidar_active else (0, 0, 200)
+        cv2.putText(vis, lidar_text, (10, 300),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, lidar_colour, 2)
+
         # Controls help
-        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Lane Mask [T]=Lead Vehicle [W/S/A/D]=Drive [Q]=Quit", 
+        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Lane Mask [T]=Lead Vehicle [W/S/A/D]=Drive [Q]=Quit",
                    (10, vis.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 2)
         
         return vis, None

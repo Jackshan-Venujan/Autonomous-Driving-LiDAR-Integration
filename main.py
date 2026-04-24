@@ -63,8 +63,56 @@ class AutonomousDrivingSystem:
         self.camera = self.world.spawn_actor(camera_bp, cam_transform, attach_to=self.vehicle)
         
         self.camera_data = None
+        # Timestamps let us verify both frames were captured within
+        # 100 ms of each other before using them for stereo depth.
+        self.camera_timestamp = None
         self.camera.listen(lambda image: self._camera_callback(image))
-        
+
+        # ── RIGHT camera for stereo vision ──────────────────────────
+        # Placed 0.54 m to the right of the LEFT camera (y=0.54).
+        # The separation between the two lenses is called the "baseline".
+        # Stereo depth works by comparing how much an object shifts
+        # between the two images — more shift = object is closer.
+        # All other parameters are identical to the LEFT camera.
+        # ─────────────────────────────────────────────────────────────
+        right_cam_transform = carla.Transform(
+            carla.Location(x=2.0, y=0.54, z=1.4),
+            carla.Rotation(pitch=-15)
+        )
+        self.right_camera = self.world.spawn_actor(
+            camera_bp, right_cam_transform, attach_to=self.vehicle
+        )
+        # Timestamps let us verify both frames were captured within
+        # 100 ms of each other before using them for stereo depth.
+        self.right_camera_data = None
+        self.right_camera_timestamp = None
+        self.right_camera.listen(lambda image: self._right_camera_callback(image))
+
+        # ── LiDAR sensor ────────────────────────────────────────────────
+        # Mounted on the vehicle roof (z=2.4, above both cameras at z=1.4).
+        # A LiDAR fires laser pulses in a 360° rotating pattern and measures
+        # how long each pulse takes to return — giving exact 3D distances.
+        # Each frame produces thousands of 3D points (a "point cloud").
+        # Unlike cameras, LiDAR works in complete darkness.
+        # ────────────────────────────────────────────────────────────────
+        lidar_bp = bp.find('sensor.lidar.ray_cast')
+        lidar_bp.set_attribute('channels',            '32')
+        lidar_bp.set_attribute('range',               '50.0')
+        lidar_bp.set_attribute('points_per_second',   '56000')
+        lidar_bp.set_attribute('rotation_frequency',  '10')
+        lidar_bp.set_attribute('upper_fov',           '10.0')
+        lidar_bp.set_attribute('lower_fov',           '-30.0')
+
+        lidar_transform = carla.Transform(
+            carla.Location(x=0.0, y=0.0, z=2.4)
+        )
+        self.lidar_sensor = self.world.spawn_actor(
+            lidar_bp, lidar_transform, attach_to=self.vehicle
+        )
+        self.lidar_data      = None
+        self.lidar_timestamp = None
+        self.lidar_sensor.listen(lambda data: self._lidar_callback(data))
+
         # Initialize driving agent
         self.agent = DrivingAgent(self.world, self.vehicle)
         
@@ -79,6 +127,41 @@ class AutonomousDrivingSystem:
         # No need to reverse channels - OpenCV expects BGR
         array = array[:, :, :3]  # Keep BGR, drop alpha
         self.camera_data = array
+        self.camera_timestamp = image.timestamp
+
+    def _right_camera_callback(self, image):
+        """Right camera callback for stereo vision.
+
+        Identical BGRA→BGR conversion as the left camera callback.
+        Stores both the frame and its CARLA timestamp so the main loop
+        can verify left/right frames are within 100 ms of each other
+        before passing them to the stereo depth estimator.
+        """
+        import numpy as np
+        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+        array = np.reshape(array, (image.height, image.width, 4))
+        array = array[:, :, :3]  # Keep BGR, drop alpha
+        self.right_camera_data = array
+        self.right_camera_timestamp = image.timestamp
+
+    def _lidar_callback(self, data):
+        """LiDAR callback — converts raw bytes to a float32 point cloud.
+
+        CARLA LiDAR returns raw bytes. We convert to a numpy float32 array
+        shaped (N, 4) where each row is [x, y, z, intensity] for one point.
+
+        CARLA LiDAR coordinate convention:
+          x = forward (away from vehicle front)
+          y = left
+          z = up
+        This differs from the camera frame (x=right, y=down, z=forward).
+        We do NOT convert here — LidarDistanceEstimator handles coordinates.
+        """
+        import numpy as np
+        points = np.frombuffer(data.raw_data, dtype=np.float32)
+        points = points.reshape(-1, 4)
+        self.lidar_data      = points
+        self.lidar_timestamp = data.timestamp
     
     def run(self, duration=300, spawn_traffic=True):
         """Run autonomous driving"""
@@ -166,8 +249,22 @@ class AutonomousDrivingSystem:
                 if key == ord('q'):
                     break
                 
+                # Only pass a right frame to the agent when both cameras have
+                # delivered a frame AND the frames are within 100 ms of each
+                # other. Frames captured at very different times would give
+                # wrong stereo depth because the vehicle may have moved.
+                right_frame = None
+                if (self.right_camera_data is not None
+                        and self.camera_timestamp is not None
+                        and self.right_camera_timestamp is not None
+                        and abs(self.camera_timestamp
+                                - self.right_camera_timestamp) < 0.1):
+                    right_frame = self.right_camera_data
+
                 # Process frame
-                result = self.agent.process_frame(self.camera_data)
+                result = self.agent.process_frame(self.camera_data,
+                                                  right_frame=right_frame,
+                                                  lidar_data=self.lidar_data)
                 
                 # Apply control
                 self.vehicle.apply_control(result['control'])
@@ -218,7 +315,7 @@ class AutonomousDrivingSystem:
         except Exception as e:
             print(f"   ⚠️ Error in agent cleanup: {e}")
         
-        # 4. Destroy camera BEFORE vehicle
+        # 4. Destroy left camera BEFORE vehicle
         try:
             if hasattr(self, 'camera') and self.camera is not None:
                 self.camera.stop()  # Stop listening first
@@ -226,6 +323,24 @@ class AutonomousDrivingSystem:
                 self.camera.destroy()
         except Exception as e:
             print(f"   ⚠️ Camera cleanup error: {e}")
+
+        # 4b. Destroy right (stereo) camera BEFORE vehicle
+        try:
+            if hasattr(self, 'right_camera') and self.right_camera is not None:
+                self.right_camera.stop()
+                time.sleep(0.1)
+                self.right_camera.destroy()
+        except Exception as e:
+            print(f"   ⚠️ Right camera cleanup error: {e}")
+
+        # 4c. Destroy LiDAR sensor BEFORE vehicle
+        try:
+            if hasattr(self, 'lidar_sensor') and self.lidar_sensor is not None:
+                self.lidar_sensor.stop()
+                time.sleep(0.1)
+                self.lidar_sensor.destroy()
+        except Exception as e:
+            print(f"   ⚠️ LiDAR cleanup error: {e}")
         
         # 5. Destroy vehicle last
         try:
