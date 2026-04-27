@@ -9,6 +9,7 @@ import time
 import sys
 
 from modules.driving_agent import DrivingAgent
+from core.lidar_sensor import LidarSensor
 
 
 class AutonomousDrivingSystem:
@@ -61,12 +62,23 @@ class AutonomousDrivingSystem:
             carla.Rotation(pitch=-15)
         )
         self.camera = self.world.spawn_actor(camera_bp, cam_transform, attach_to=self.vehicle)
-        
+
         self.camera_data = None
         self.camera.listen(lambda image: self._camera_callback(image))
-        
-        # Initialize driving agent
-        self.agent = DrivingAgent(self.world, self.vehicle)
+
+        # Spawn LiDAR sensor
+        lidar_bp = bp.find('sensor.lidar.ray_cast')
+        lidar_bp.set_attribute('channels', '32')
+        lidar_bp.set_attribute('points_per_second', '56000')
+        lidar_bp.set_attribute('rotation_frequency', '20')
+        lidar_bp.set_attribute('range', '50')
+        lidar_bp.set_attribute('upper_fov', '5')
+        lidar_bp.set_attribute('lower_fov', '-25')
+        lidar_transform = carla.Transform(carla.Location(x=2.0, z=1.8))
+        self.lidar = LidarSensor(self.world, self.vehicle, lidar_bp, lidar_transform)
+
+        # Initialize driving agent (with LiDAR)
+        self.agent = DrivingAgent(self.world, self.vehicle, lidar_sensor=self.lidar)
         
         print("✓ System initialized")
     
@@ -87,6 +99,7 @@ class AutonomousDrivingSystem:
         print("  [L] = Autonomous Mode (with Traffic Light Detection)")
         print("  [M] = Manual Mode")
         print("  [V] = Toggle Lane Mask Visualization")
+        print("  [P] = Toggle LiDAR Top-Down BEV Window")
         print("  [T] = Toggle Lead Vehicle (test your model!)")
         print("  [N] = Night  [B] = Bright (Day)")
         print("  [W/A/S/D] = Manual throttle/brake/steering")
@@ -141,9 +154,13 @@ class AutonomousDrivingSystem:
                 elif key == ord('b'):
                     self.set_day()
                 
-                # NEW: Toggle lane mask visualization
+                # Toggle lane mask visualization
                 elif key == ord('v'):
                     self.agent.toggle_lane_mask_visualization()
+
+                # Toggle LiDAR BEV window
+                elif key == ord('p'):
+                    self.agent.toggle_lidar_view()
                 
                 # NEW: Toggle lead vehicle
                 elif key == ord('t'):
@@ -177,6 +194,9 @@ class AutonomousDrivingSystem:
                 
                 if vis is not None:
                     cv2.imshow('Autonomous Driving - Modular', vis)
+
+                # LiDAR BEV window (toggled by [P])
+                self.agent.visualize_lidar()
                 
                 # Status
                 if frame_count % 100 == 0:
@@ -218,7 +238,14 @@ class AutonomousDrivingSystem:
         except Exception as e:
             print(f"   ⚠️ Error in agent cleanup: {e}")
         
-        # 4. Destroy camera BEFORE vehicle
+        # 4a. Destroy LiDAR before camera
+        try:
+            if hasattr(self, 'lidar') and self.lidar is not None:
+                self.lidar.destroy()
+        except Exception as e:
+            print(f"   ⚠️ LiDAR cleanup error: {e}")
+
+        # 4b. Destroy camera BEFORE vehicle
         try:
             if hasattr(self, 'camera') and self.camera is not None:
                 self.camera.stop()  # Stop listening first

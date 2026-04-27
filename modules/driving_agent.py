@@ -25,6 +25,11 @@ from core.carla_spawner import CarlaSpawner
 # UPDATED: Import from detection module
 from detection.yolo_lane_filter import YOLOLaneFilter
 
+# LiDAR integration
+from core.lidar_processor import LidarProcessor
+from core.lidar_obstacle_detector import LidarObstacleDetector, ACTION_PRIORITY
+from core.lidar_fusion import LidarFusion
+
 # Control parameters - Tuned for smooth steering at 15 km/h
 PID_KP, PID_KI, PID_KD = 0.45, 0.015, 0.28  # Lower P, higher D for smoother response
 STEER_LIMIT = 0.25
@@ -44,10 +49,17 @@ MAN_MAX_BRAKE = 1.00
 class DrivingAgent:
     """Autonomous driving agent with lane keeping and obstacle avoidance"""
     
-    def __init__(self, world: carla.World, vehicle: carla.Vehicle):
+    def __init__(self, world: carla.World, vehicle: carla.Vehicle, lidar_sensor=None):
         """Initialize driving agent"""
         self.world = world
         self.vehicle = vehicle
+
+        # LiDAR pipeline (optional — gracefully disabled if sensor not provided)
+        self.lidar_sensor = lidar_sensor
+        self.lidar_processor = LidarProcessor() if lidar_sensor else None
+        self.lidar_obstacle_detector = LidarObstacleDetector() if lidar_sensor else None
+        self.lidar_fusion = LidarFusion() if lidar_sensor else None
+        self.show_lidar_view = False  # toggled by [P] key
         
         # Initialize modules
         self.lane_detector = LaneDetector()
@@ -340,13 +352,54 @@ class DrivingAgent:
             overlap_threshold=0.3
         )
         
-        # Get obstacle action with speed-adaptive thresholds
-        obstacle_action, nearest_obstacle = self.obstacle_detector.should_stop(
-            lane_detections, 
+        # Get obstacle action with speed-adaptive thresholds (camera-based)
+        camera_action, camera_nearest = self.obstacle_detector.should_stop(
+            lane_detections,
             vehicle_speed_kmh=current_speed
         )
+
+        # --- LiDAR pipeline ---
+        lidar_obstacles = []
+        if self.lidar_sensor is not None:
+            raw_pts, _ = self.lidar_sensor.get_latest()
+            if raw_pts is not None:
+                filtered_pts = self.lidar_processor.preprocess(raw_pts)
+                lidar_obstacles = self.lidar_obstacle_detector.detect(
+                    filtered_pts, vehicle_speed_kmh=current_speed
+                )
+
+        # --- Camera-LiDAR fusion ---
+        if self.lidar_sensor is not None and lidar_obstacles is not None:
+            focal_px = getattr(self.obstacle_detector, 'focal_length', 640.0)
+            fused_detections, obstacle_action, nearest_obstacle = self.lidar_fusion.fuse(
+                camera_detections=lane_detections,
+                lidar_obstacles=lidar_obstacles,
+                camera_action=camera_action,
+                vehicle_speed_kmh=current_speed,
+                img_width=self.lane_detector.img_w,
+                focal_length_px=focal_px,
+            )
+            # Terminal log when any obstacle is present
+            cam_d = self.lidar_fusion.last_camera_dist
+            lid_d = self.lidar_fusion.last_lidar_dist
+            if cam_d is not None or lid_d is not None:
+                cam_str = f"{cam_d:.1f}m" if cam_d is not None else "---"
+                lid_str = f"{lid_d:.1f}m" if lid_d is not None else "---"
+                nearest_cls = nearest_obstacle.get('class', '?') if nearest_obstacle else '?'
+                print(
+                    f"[FRAME {self.frame_count}] "
+                    f"CAM={cam_str}({camera_action}) "
+                    f"LIDAR={lid_str}({self.lidar_fusion.last_lidar_front_action}) "
+                    f"FUSED={obstacle_action}  obj={nearest_cls}"
+                )
+        else:
+            # No LiDAR — camera only
+            fused_detections = lane_detections
+            obstacle_action = camera_action
+            nearest_obstacle = camera_nearest
+
         self.obstacle_action = obstacle_action
-        
+
         lane_lost = self.lane_detector.is_lane_lost()
         
         # Check traffic light state
@@ -391,9 +444,10 @@ class DrivingAgent:
             'lane_data': lane_result,
             'obstacle_data': {
                 'all_detections': all_detections,
-                'lane_detections': lane_detections,
+                'lane_detections': fused_detections,   # fused camera+LiDAR list
                 'nearest_obstacle': nearest_obstacle,
-                'obstacle_action': obstacle_action
+                'obstacle_action': obstacle_action,
+                'lidar_obstacles': lidar_obstacles,
             },
             'traffic_light_data': traffic_light_data,
             'decision': decision
@@ -816,14 +870,37 @@ class DrivingAgent:
                     points = np.array(lane, dtype=np.int32)
                     cv2.polylines(vis, [points], False, color, 2)
         
-        # Draw obstacles
+        # Draw obstacles (camera bboxes via obstacle_detector)
         if result['obstacle_data']:
             obs_data = result['obstacle_data']
-            vis = self.obstacle_detector.visualize(
-                vis, 
-                obs_data['lane_detections'],
-                None
-            )
+            # Filter to only camera detections that have a bbox for the standard visualizer
+            camera_dets = [d for d in obs_data['lane_detections'] if d.get('bbox') is not None]
+            vis = self.obstacle_detector.visualize(vis, camera_dets, None)
+
+            # --- LiDAR distance overlay on matched detections ---
+            for det in obs_data['lane_detections']:
+                lidar_dist = det.get('lidar_distance')
+                fusion_method = det.get('fusion_method', 'CAMERA_ONLY')
+                bbox = det.get('bbox')
+                cam_dist = det.get('distance')
+
+                if fusion_method == 'FULL' and bbox is not None and lidar_dist is not None:
+                    x1, y1 = int(bbox[0]), int(bbox[1])
+                    cam_lbl = f"CAM:{cam_dist:.1f}m" if cam_dist else "CAM:---"
+                    lid_lbl = f"LIDAR:{lidar_dist:.1f}m"
+                    cv2.putText(vis, cam_lbl, (x1, max(0, y1 - 42)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 200, 255), 2)
+                    cv2.putText(vis, lid_lbl, (x1, max(0, y1 - 26)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 200), 2)
+
+                # LiDAR-only obstacles (no camera bbox)
+                elif fusion_method == 'LIDAR_ONLY' and bbox is None:
+                    dist = lidar_dist or det.get('distance', 0.0)
+                    angle = det.get('angle_deg', 0.0)
+                    side = 'R' if angle > 0 else 'L'
+                    lbl = f"[LIDAR-ONLY] unknown  {dist:.1f}m  {angle:+.0f}deg({side})"
+                    cv2.putText(vis, lbl, (10, vis.shape[0] - 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
         
         # Draw HUD
         speed = self._get_vehicle_speed()
@@ -885,23 +962,85 @@ class DrivingAgent:
         # Lead vehicle status
         lead_status = self.lead_vehicle.get_status()
         if lead_status:
-            cv2.putText(vis, f"Lead Vehicle: {lead_status['distance']:.1f}m @ {lead_status['speed']:.1f} km/h", 
+            cv2.putText(vis, f"Lead Vehicle: {lead_status['distance']:.1f}m @ {lead_status['speed']:.1f} km/h",
                        (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 255), 2)
-        
+
+        # --- LiDAR fusion HUD panel ---
+        if self.lidar_sensor is not None and self.lidar_fusion is not None:
+            cam_dist = self.lidar_fusion.last_camera_dist
+            lid_dist = self.lidar_fusion.last_lidar_dist
+            cam_act  = self.lidar_fusion.last_camera_action
+            lid_act  = self.lidar_fusion.last_lidar_front_action
+            fused_act = self.lidar_fusion.last_fused_action
+
+            # Semi-transparent black panel
+            panel_y, panel_h, panel_w = 268, 115, 430
+            overlay = vis.copy()
+            cv2.rectangle(overlay, (0, panel_y), (panel_w, panel_y + panel_h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.55, vis, 0.45, 0, vis)
+
+            # Camera row
+            cam_str = f"CAM  dist: {cam_dist:.1f}m  ->  {cam_act.upper()}" if cam_dist is not None \
+                      else f"CAM  dist: ---          ->  {cam_act.upper()}"
+            cv2.putText(vis, cam_str, (8, panel_y + 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 200, 255), 2)
+
+            # LiDAR row
+            lid_str = f"LIDAR dist: {lid_dist:.1f}m  ->  {lid_act.upper()}" if lid_dist is not None \
+                      else f"LIDAR dist: ---          ->  {lid_act.upper()}"
+            cv2.putText(vis, lid_str, (8, panel_y + 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 255, 180), 2)
+
+            # Fused action row (colour by severity)
+            _act_colors = {
+                'drive': (0, 255, 0), 'cautious': (0, 215, 255),
+                'slow': (0, 165, 255), 'stop': (0, 69, 255), 'emergency_stop': (0, 0, 255),
+            }
+            fused_color = _act_colors.get(fused_act, (255, 255, 255))
+            cv2.putText(vis, f"FUSED action: {fused_act.upper()}", (8, panel_y + 78),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, fused_color, 2)
+
+            # Side obstacle row
+            if self.lidar_obstacle_detector is not None:
+                side_obs = [o for o in self.lidar_obstacle_detector._last_obstacles
+                            if o.sector in ('side_left', 'side_right')]
+                if side_obs:
+                    sides = ', '.join(sorted(set(o.sector.replace('side_', '') for o in side_obs)))
+                    cv2.putText(vis, f"LIDAR side: CAUTIOUS  ({sides})", (8, panel_y + 104),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 215, 255), 2)
+
         # Controls help
-        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Lane Mask [T]=Lead Vehicle [W/S/A/D]=Drive [Q]=Quit", 
-                   (10, vis.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 2)
-        
+        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Lane Mask [T]=Lead Vehicle [P]=LiDAR View [Q]=Quit",
+                   (10, vis.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 2)
+
         return vis, None
     
+    def toggle_lidar_view(self):
+        """Toggle the LiDAR BEV window (hotkey [P])."""
+        self.show_lidar_view = not self.show_lidar_view
+        if not self.show_lidar_view:
+            cv2.destroyWindow('LiDAR Top-Down')
+        print(f"LiDAR BEV view: {'ON' if self.show_lidar_view else 'OFF'}")
+
+    def visualize_lidar(self):
+        """Render the LiDAR top-down BEV window when enabled."""
+        if not self.show_lidar_view or self.lidar_obstacle_detector is None:
+            return
+        bev = self.lidar_obstacle_detector.render_bev()
+        cv2.imshow('LiDAR Top-Down', bev)
+
     def cleanup(self):
         """Cleanup resources"""
         # Cleanup lead vehicle first
         self.lead_vehicle.destroy()
-        
+
         if self.spawner:
             self.spawner.cleanup()
-        
+
+        # Destroy LiDAR sensor before vehicle
+        if self.lidar_sensor is not None:
+            self.lidar_sensor.destroy()
+
         # Stop vehicle
         control = carla.VehicleControl()
         control.throttle = 0.0
