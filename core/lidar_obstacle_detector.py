@@ -47,12 +47,14 @@ ACTION_PRIORITY = {'drive': 0, 'cautious': 1, 'slow': 2, 'stop': 3, 'emergency_s
 class LidarObstacleDetector:
     """Clusters a preprocessed point cloud and classifies each cluster by danger level."""
 
-    FRONT_ANGLE_DEG = 60.0   # ±60° from forward = front sector
-    SIDE_ANGLE_DEG = 120.0   # 60°–120° = side sectors; >120° = rear (ignored)
+    FRONT_ANGLE_DEG = 35.0      # ±35° from forward = front sector
+    SIDE_ANGLE_DEG  = 120.0     # 35°–120° = side sectors; >120° = rear (ignored)
+    FRONT_MAX_LATERAL_M = 3.0   # front obstacle centroid must be within ±3 m of ego centreline
+                                 # excludes road barriers/walls at the lane edge
 
     def __init__(
         self,
-        eps: float = 0.5,
+        eps: float = 0.75,
         min_samples: int = 3,
         base_emergency_dist: float = 3,         # 7.5
         base_stop_dist: float = 5.0,            # 15.0
@@ -70,6 +72,7 @@ class LidarObstacleDetector:
 
         self._last_obstacles: List[LidarObstacle] = []
         self._last_raw_points: Optional[np.ndarray] = None
+        self._prev_front_obstacles: List[LidarObstacle] = []  # 1-frame persistence buffer
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -84,10 +87,7 @@ class LidarObstacleDetector:
             'cautious':  self.base_cautious_dist  + extra * 0.5,
         }
 
-    def _classify_danger(self, distance: float, sector: str, thresholds: dict) -> str:
-        if sector in ('side_left', 'side_right'):
-            return 'cautious'   # sides never trigger stop
-        # front sector
+    def _raw_danger(self, distance: float, thresholds: dict) -> str:
         if distance <= thresholds['emergency']:
             return 'emergency_stop'
         if distance <= thresholds['stop']:
@@ -97,6 +97,15 @@ class LidarObstacleDetector:
         if distance <= thresholds['cautious']:
             return 'cautious'
         return 'drive'
+
+    def _classify_danger(self, distance: float, sector: str, thresholds: dict, point_count: int = 0) -> str:
+        if sector in ('side_left', 'side_right'):
+            return 'cautious'   # sides never trigger stop
+        raw = self._raw_danger(distance, thresholds)
+        # Sparse clusters (< 8 pts) are likely noise — cap danger at 'slow'
+        if point_count < 8 and ACTION_PRIORITY[raw] > ACTION_PRIORITY['slow']:
+            return 'slow'
+        return raw
 
     # ------------------------------------------------------------------
     # Public API
@@ -134,18 +143,30 @@ class LidarObstacleDetector:
             cx = float(np.mean(cluster[:, 0]))
             cy = float(np.mean(cluster[:, 1]))
             cz = float(np.mean(cluster[:, 2]))
-            dist = math.sqrt(cx ** 2 + cy ** 2)
+
+            # Use centroid angle for sector/matching — centroid is representative of where the object is
             angle_deg = math.degrees(math.atan2(cy, cx))  # +right / -left
+
+            # Use MINIMUM point distance (closest surface of obstacle) — stable across cluster splits
+            pt_dists = np.sqrt(cluster[:, 0] ** 2 + cluster[:, 1] ** 2)
+            dist = float(np.min(pt_dists))
 
             abs_angle = abs(angle_deg)
             if abs_angle <= self.FRONT_ANGLE_DEG:
-                sector = 'front'
+                # Lateral sanity check: road barriers/walls have large |cy|.
+                # If the centroid is outside ±FRONT_MAX_LATERAL_M it is not in the
+                # driving corridor — demote to side so it never triggers stop/emergency.
+                if abs(cy) <= self.FRONT_MAX_LATERAL_M:
+                    sector = 'front'
+                else:
+                    sector = 'side_right' if cy > 0 else 'side_left'
             elif abs_angle <= self.SIDE_ANGLE_DEG:
                 sector = 'side_right' if angle_deg > 0 else 'side_left'
             else:
                 continue  # rear — skip
 
-            danger = self._classify_danger(dist, sector, thresholds)
+            pt_count = int(np.sum(mask))
+            danger = self._classify_danger(dist, sector, thresholds, point_count=pt_count)
 
             self._last_obstacles.append(LidarObstacle(
                 centroid_x=cx,
@@ -154,13 +175,21 @@ class LidarObstacleDetector:
                 distance=dist,
                 angle_deg=angle_deg,
                 sector=sector,
-                point_count=int(np.sum(mask)),
+                point_count=pt_count,
                 danger_level=danger,
                 bbox_min_x=float(np.min(cluster[:, 0])),
                 bbox_max_x=float(np.max(cluster[:, 0])),
                 bbox_min_y=float(np.min(cluster[:, 1])),
                 bbox_max_y=float(np.max(cluster[:, 1])),
             ))
+
+        # 1-frame persistence: if front sector is empty this frame but had obstacles last frame,
+        # carry the previous obstacles forward to absorb single-frame spinning-beam dropout.
+        current_front = [o for o in self._last_obstacles if o.sector == 'front']
+        if len(current_front) == 0 and len(self._prev_front_obstacles) > 0:
+            self._last_obstacles.extend(self._prev_front_obstacles)
+
+        self._prev_front_obstacles = [o for o in self._last_obstacles if o.sector == 'front']
 
         return self._last_obstacles
 

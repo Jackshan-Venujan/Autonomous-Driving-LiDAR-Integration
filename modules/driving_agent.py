@@ -5,6 +5,7 @@ Decision-making and control for autonomous driving with manual mode support
 
 import carla
 import cv2
+import math
 import time
 from collections import deque
 from typing import Dict, Tuple, Optional
@@ -60,6 +61,8 @@ class DrivingAgent:
         self.lidar_obstacle_detector = LidarObstacleDetector() if lidar_sensor else None
         self.lidar_fusion = LidarFusion() if lidar_sensor else None
         self.show_lidar_view = False  # toggled by [P] key
+        # Stabilize LiDAR front action over last 5 frames to absorb spinning-beam dropouts
+        self._lidar_action_history: deque = deque(['drive'] * 5, maxlen=5)
         
         # Initialize modules
         self.lane_detector = LaneDetector()
@@ -165,6 +168,8 @@ class DrivingAgent:
                 self.manual_brake = 0.0
                 self.manual_steer = 0.0
                 self.manual_reverse = False
+                # Clear LiDAR history so switching to auto doesn't inherit stale actions
+                self._lidar_action_history = deque(['drive'] * 5, maxlen=5)
         else:
             print(f"⚠️ Invalid mode: {mode}")
     
@@ -279,12 +284,25 @@ class DrivingAgent:
         traffic_light_data = None
         if self.traffic_light_enabled:
             traffic_light_data = self.traffic_light_detector.detect(image)
-        
+
+        # Current speed needed by LiDAR in all modes
+        current_speed = self._get_vehicle_speed()
+
+        # --- LiDAR pipeline (runs in ALL modes for BEV visualization) ---
+        lidar_obstacles = []
+        if self.lidar_sensor is not None:
+            raw_pts, _ = self.lidar_sensor.get_latest()
+            if raw_pts is not None:
+                filtered_pts = self.lidar_processor.preprocess(raw_pts)
+                lidar_obstacles = self.lidar_obstacle_detector.detect(
+                    filtered_pts, vehicle_speed_kmh=current_speed
+                )
+
         # Manual mode
         if self.mode == 'manual':
             lane_result = self.lane_detector.detect(image)
             all_detections, _ = self.obstacle_detector.detect(image)
-            
+
             if lane_result:
                 # CREATE LANE MASK with TRIANGULAR ROI
                 # When only 1 lane detected: Uses fixed-width trapezoid (20-22% of image width)
@@ -296,7 +314,7 @@ class DrivingAgent:
                     forward_extension=250
                     # Uses default: max_vertical_extent_single=0.8, max_vertical_extent_dual=0.9
                 )
-                
+
                 # Filter detections using the proper lane filter
                 lane_detections = self.yolo_lane_filter.filter_detections_by_lane(
                     all_detections,
@@ -304,9 +322,9 @@ class DrivingAgent:
                 )
             else:
                 lane_detections = []
-            
+
             control = self.apply_manual_control()
-            
+
             return {
                 'control': control,
                 'lane_data': lane_result,
@@ -317,9 +335,10 @@ class DrivingAgent:
                     'should_stop': False
                 },
                 'traffic_light_data': traffic_light_data,
+                'lidar_obstacles': lidar_obstacles,
                 'decision': 'MANUAL CONTROL'
             }
-        
+
         # Auto mode
         lane_result = self.lane_detector.detect(image)
         if lane_result is None:
@@ -328,12 +347,9 @@ class DrivingAgent:
             return result
         # Update lane count for speed policy
         self.last_lanes_detected = lane_result.get('lanes_detected', 0)
-        
+
         lateral_error = self.lane_detector.compute_lateral_error(lane_result['filtered_lanes'])
-        
-        # Get current speed for adaptive detection
-        current_speed = self._get_vehicle_speed()
-        
+
         all_detections, _ = self.obstacle_detector.detect(image, vehicle_speed_kmh=current_speed)
         
         # CREATE LANE MASK with TRIANGULAR ROI
@@ -358,16 +374,6 @@ class DrivingAgent:
             vehicle_speed_kmh=current_speed
         )
 
-        # --- LiDAR pipeline ---
-        lidar_obstacles = []
-        if self.lidar_sensor is not None:
-            raw_pts, _ = self.lidar_sensor.get_latest()
-            if raw_pts is not None:
-                filtered_pts = self.lidar_processor.preprocess(raw_pts)
-                lidar_obstacles = self.lidar_obstacle_detector.detect(
-                    filtered_pts, vehicle_speed_kmh=current_speed
-                )
-
         # --- Camera-LiDAR fusion ---
         if self.lidar_sensor is not None and lidar_obstacles is not None:
             focal_px = getattr(self.obstacle_detector, 'focal_length', 640.0)
@@ -379,6 +385,19 @@ class DrivingAgent:
                 img_width=self.lane_detector.img_w,
                 focal_length_px=focal_px,
             )
+
+            # Stabilize LiDAR front action over last 5 frames — absorbs spinning-beam single-frame dropouts.
+            # The history takes the worst-case (most dangerous) of recent frames, so one empty scan
+            # doesn't snap the action back to 'drive' while a truck is still right in front.
+            self._lidar_action_history.append(self.lidar_fusion.last_lidar_front_action)
+            stable_lidar_action = max(self._lidar_action_history,
+                                      key=lambda a: ACTION_PRIORITY.get(a, 0))
+            stable_fused = max([self.lidar_fusion.last_camera_action, stable_lidar_action],
+                               key=lambda a: ACTION_PRIORITY.get(a, 0))
+            self.lidar_fusion.last_lidar_front_action = stable_lidar_action
+            self.lidar_fusion.last_fused_action = stable_fused
+            obstacle_action = stable_fused
+
             # Terminal log when any obstacle is present
             cam_d = self.lidar_fusion.last_camera_dist
             lid_d = self.lidar_fusion.last_lidar_dist
@@ -389,7 +408,7 @@ class DrivingAgent:
                 print(
                     f"[FRAME {self.frame_count}] "
                     f"CAM={cam_str}({camera_action}) "
-                    f"LIDAR={lid_str}({self.lidar_fusion.last_lidar_front_action}) "
+                    f"LIDAR={lid_str}({stable_lidar_action}) "
                     f"FUSED={obstacle_action}  obj={nearest_cls}"
                 )
         else:
@@ -893,14 +912,26 @@ class DrivingAgent:
                     cv2.putText(vis, lid_lbl, (x1, max(0, y1 - 26)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 200), 2)
 
-                # LiDAR-only obstacles (no camera bbox)
+                # LiDAR-only obstacles — project to approximate camera bbox
                 elif fusion_method == 'LIDAR_ONLY' and bbox is None:
-                    dist = lidar_dist or det.get('distance', 0.0)
+                    dist = lidar_dist or det.get('distance', 1.0)
                     angle = det.get('angle_deg', 0.0)
-                    side = 'R' if angle > 0 else 'L'
-                    lbl = f"[LIDAR-ONLY] unknown  {dist:.1f}m  {angle:+.0f}deg({side})"
-                    cv2.putText(vis, lbl, (10, vis.shape[0] - 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
+                    focal = getattr(self.obstacle_detector, 'focal_length', 640.0)
+                    img_h, img_w = vis.shape[:2]
+
+                    cx_px = int(img_w / 2 + focal * math.tan(math.radians(angle)))
+                    box_h = max(20, int(img_h * 1.6 / max(1.0, dist)))
+                    box_w = max(15, int(box_h * 0.6))
+                    cy_px = int(img_h * 0.55 + img_h * 0.15 * (1.0 - dist / 50.0))
+
+                    bx1 = max(0, cx_px - box_w // 2)
+                    by1 = max(0, cy_px - box_h // 2)
+                    bx2 = min(img_w - 1, cx_px + box_w // 2)
+                    by2 = min(img_h - 1, cy_px + box_h // 2)
+
+                    cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
+                    cv2.putText(vis, f"LIDAR {dist:.1f}m", (bx1, max(10, by1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2)
         
         # Draw HUD
         speed = self._get_vehicle_speed()

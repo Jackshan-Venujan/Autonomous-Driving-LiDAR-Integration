@@ -6,7 +6,7 @@ import numpy as np
 
 
 class LidarProcessor:
-    """Converts raw (N, 4) XYZІ point cloud to a clean (M, 3) XYZ array."""
+    """Converts raw (N, 4) XYZI point cloud to a clean (M, 3) XYZ array."""
 
     def __init__(
         self,
