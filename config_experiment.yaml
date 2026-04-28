@@ -1,0 +1,95 @@
+carla:
+  host: "localhost"
+  port: 2000
+  timeout_s: 10.0
+  world_map: "Town04"
+  synchronous_mode: true
+  fixed_delta_seconds: 0.05   # 20 Hz simulation
+
+ego_vehicle:
+  blueprint: "vehicle.tesla.model3"
+  spawn_index: 0
+
+camera:
+  image_width: 1280
+  image_height: 720
+  fov_degrees: 90.0
+  position_x: 2.0
+  position_z: 1.4
+  pitch_degrees: -15.0
+
+experiment_1_lidar_mono:
+  name: "lidar_monocular_fusion"
+  lidar:
+    channels: 32
+    points_per_second: 56000
+    rotation_frequency: 20
+    range_m: 50
+    upper_fov: 10
+    lower_fov: -10
+    position_x: 2.0
+    position_z: 1.8
+
+experiment_2_stereo:
+  name: "stereo_camera_fusion"
+  stereo:
+    baseline_m: 0.12
+    sgbm_num_disparities: 128   # must be divisible by 16
+    sgbm_block_size: 11          # odd, 5–21
+    sgbm_p1: 2904                # 8 * 3 * 11 * 11
+    sgbm_p2: 11616               # 32 * 3 * 11 * 11
+    sgbm_disp12_max_diff: 1
+    sgbm_uniqueness_ratio: 10
+    sgbm_speckle_window_size: 100
+    sgbm_speckle_range: 32
+    sgbm_pre_filter_cap: 63
+    sgbm_mode: 3                 # cv2.STEREO_SGBM_MODE_SGBM_3WAY
+
+yolo:
+  model_path: "yolo11n.pt"
+  conf_threshold: 0.5
+
+metrics:
+  azimuth_tolerance_deg: 15.0
+  distance_tolerance_m: 8.0
+  depth_percentile: 20.0        # 20th-percentile of bbox depth pixels (robust near surface)
+  max_range_m: 80.0             # GT actors beyond this are ignored
+
+output:
+  base_dir: "output/experiment_results"
+  gt_log_filename: "gt_log.jsonl"
+  comparison_dir: "output/comparison"
+
+scenarios:
+  # Traffic is fixed — weather is the sole independent variable
+  - name: "clear_noon"
+    weather_preset: "ClearNoon"
+    num_vehicles: 15
+    num_pedestrians: 5
+    num_static: 3
+    duration_ticks: 500
+    tag: "clear"
+
+  - name: "hard_rain_noon"
+    weather_preset: "HardRainNoon"
+    num_vehicles: 15
+    num_pedestrians: 5
+    num_static: 3
+    duration_ticks: 500
+    tag: "rain"
+
+  - name: "clear_night"
+    weather_preset: "ClearNight"
+    num_vehicles: 15
+    num_pedestrians: 5
+    num_static: 3
+    duration_ticks: 500
+    tag: "night"
+
+  - name: "cloudy_sunset"
+    weather_preset: "CloudySunset"
+    num_vehicles: 15
+    num_pedestrians: 5
+    num_static: 3
+    duration_ticks: 500
+    tag: "cloudy_evening"

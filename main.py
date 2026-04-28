@@ -72,8 +72,8 @@ class AutonomousDrivingSystem:
         lidar_bp.set_attribute('points_per_second', '56000')
         lidar_bp.set_attribute('rotation_frequency', '20')
         lidar_bp.set_attribute('range', '50')
-        lidar_bp.set_attribute('upper_fov', '5')
-        lidar_bp.set_attribute('lower_fov', '-25')
+        lidar_bp.set_attribute('upper_fov', '5')       # 5
+        lidar_bp.set_attribute('lower_fov', '-25')      # -25
         lidar_transform = carla.Transform(carla.Location(x=2.0, z=1.8))
         self.lidar = LidarSensor(self.world, self.vehicle, lidar_bp, lidar_transform)
 

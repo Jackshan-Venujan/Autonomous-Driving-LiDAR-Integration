@@ -56,10 +56,10 @@ class LidarObstacleDetector:
         self,
         eps: float = 0.75,
         min_samples: int = 3,
-        base_emergency_dist: float = 3,         # 7.5
-        base_stop_dist: float = 5.0,            # 15.0
-        base_slow_dist: float = 10.0,           # 20.0
-        base_cautious_dist: float = 15.0,       # 15.0
+        base_emergency_dist: float = 7.5,         # 7.5
+        base_stop_dist: float = 15.0,             # 15.0
+        base_slow_dist: float = 20.0,             # 20.0
+        base_cautious_dist: float = 15.0,         # 15.0
         speed_factor: float = 0.5,
     ):
         self.eps = eps
