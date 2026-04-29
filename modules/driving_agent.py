@@ -10,6 +10,7 @@ from collections import deque
 from typing import Dict, Tuple, Optional
 import sys
 import os
+import numpy as np
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
