@@ -10,6 +10,8 @@ import sys
 
 from modules.driving_agent import DrivingAgent
 from core.lidar_sensor import LidarSensor
+from evaluation.live_reporter import LiveEvaluationReporter
+from evaluation.carla_gt_extractor import CarlaGTExtractor
 
 
 class AutonomousDrivingSystem:
@@ -79,6 +81,12 @@ class AutonomousDrivingSystem:
 
         # Initialize driving agent (with LiDAR)
         self.agent = DrivingAgent(self.world, self.vehicle, lidar_sensor=self.lidar)
+        
+        # Initialize live evaluation reporter
+        self.eval_reporter = LiveEvaluationReporter(output_dir='output/eval_reports')
+        
+        # Initialize CARLA ground truth extractor
+        self.gt_extractor = CarlaGTExtractor(self.world, self.vehicle, output_dir='output/ground_truth')
         
         print("✓ System initialized")
     
@@ -186,6 +194,16 @@ class AutonomousDrivingSystem:
                 # Process frame
                 result = self.agent.process_frame(self.camera_data)
                 
+                # --- NEW: Extract and save CARLA ground truth ---
+                gt_records = self.gt_extractor.extract_frame_gt(frame_count)
+                self.gt_extractor.save_frame_gt(gt_records)
+                
+                # --- NEW: Log detections to live evaluation reporter ---
+                if 'obstacle_data' in result and 'lidar_obstacles' in result:
+                    camera_dets = result['obstacle_data'].get('all_detections', [])
+                    lidar_obs = result['lidar_obstacles']
+                    self.eval_reporter.log_frame_detections(frame_count, camera_dets, lidar_obs)
+                
                 # Apply control
                 self.vehicle.apply_control(result['control'])
                 
@@ -202,6 +220,10 @@ class AutonomousDrivingSystem:
                 if frame_count % 100 == 0:
                     print(f"[{frame_count}] {self.agent.mode.upper()}: {result['decision']}")
                 
+                # --- NEW: Print live eval report every 300 frames ---
+                if frame_count > 0 and frame_count % 300 == 0:
+                    self.eval_reporter.print_live_report()
+                
                 frame_count += 1
         
         except KeyboardInterrupt:
@@ -213,6 +235,22 @@ class AutonomousDrivingSystem:
     def cleanup(self):
         """Cleanup resources - safe order"""
         print("\n🧹 Cleaning up...")
+        
+        # --- NEW: Save ground truth and evaluation reports before destroying resources ---
+        try:
+            if hasattr(self, 'gt_extractor'):
+                self.gt_extractor.print_summary()
+        except Exception as e:
+            print(f"   ⚠️ Error printing GT summary: {e}")
+        
+        # --- NEW: Save evaluation reports ---
+        try:
+            if hasattr(self, 'eval_reporter'):
+                self.eval_reporter.print_comparison_summary()
+                self.eval_reporter.save_jsonl_exports()
+                self.eval_reporter.save_summary_json()
+        except Exception as e:
+            print(f"   ⚠️ Error saving evaluation reports: {e}")
         
         # 1. Close windows first
         try:
