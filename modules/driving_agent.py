@@ -155,6 +155,16 @@ class DrivingAgent:
             print(f"  Traffic Light Detection: ENABLED")
         else:
             print(f"  Traffic Light Detection: DISABLED")
+
+    @staticmethod
+    def _lidar_overlay_color(danger_level: Optional[str]) -> Tuple[int, int, int]:
+        if danger_level in ('stop', 'emergency_stop'):
+            return (0, 0, 255)
+        if danger_level in ('cautious', 'slow'):
+            return (0, 255, 255)
+        if danger_level == 'drive':
+            return (0, 255, 0)
+        return (255, 255, 255)
     
     def set_mode(self, mode: str):
         """Switch between manual and auto mode"""
@@ -323,15 +333,33 @@ class DrivingAgent:
             else:
                 lane_detections = []
 
+            camera_action, _ = self.obstacle_detector.should_stop(
+                lane_detections,
+                vehicle_speed_kmh=current_speed
+            )
+
             control = self.apply_manual_control()
+
+            if self.lidar_fusion is not None and lidar_obstacles is not None:
+                fused_detections, _, nearest_obstacle = self.lidar_fusion.fuse(
+                    camera_detections=lane_detections,
+                    lidar_obstacles=lidar_obstacles,
+                    camera_action=camera_action,
+                    vehicle_speed_kmh=current_speed,
+                    img_width=self.lane_detector.img_w,
+                    focal_length_px=getattr(self.obstacle_detector, 'focal_length', 640.0),
+                )
+            else:
+                fused_detections = lane_detections
+                nearest_obstacle = None
 
             return {
                 'control': control,
                 'lane_data': lane_result,
                 'obstacle_data': {
                     'all_detections': all_detections,
-                    'lane_detections': lane_detections,
-                    'nearest_obstacle': None,
+                    'lane_detections': fused_detections,
+                    'nearest_obstacle': nearest_obstacle,
                     'should_stop': False
                 },
                 'traffic_light_data': traffic_light_data,
@@ -899,9 +927,11 @@ class DrivingAgent:
             # --- LiDAR distance overlay on matched detections ---
             for det in obs_data['lane_detections']:
                 lidar_dist = det.get('lidar_distance')
+                lidar_danger = det.get('lidar_danger')
                 fusion_method = det.get('fusion_method', 'CAMERA_ONLY')
                 bbox = det.get('bbox')
                 cam_dist = det.get('distance')
+                lidar_color = self._lidar_overlay_color(lidar_danger or det.get('danger_level'))
 
                 if fusion_method == 'FULL' and bbox is not None and lidar_dist is not None:
                     x1, y1 = int(bbox[0]), int(bbox[1])
@@ -911,6 +941,7 @@ class DrivingAgent:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 200, 255), 2)
                     cv2.putText(vis, lid_lbl, (x1, max(0, y1 - 26)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 200), 2)
+                    cv2.rectangle(vis, (x1, y1), (int(bbox[2]), int(bbox[3])), lidar_color, 3)
 
                 # LiDAR-only obstacles — project to approximate camera bbox
                 elif fusion_method == 'LIDAR_ONLY' and bbox is None:
@@ -929,9 +960,13 @@ class DrivingAgent:
                     bx2 = min(img_w - 1, cx_px + box_w // 2)
                     by2 = min(img_h - 1, cy_px + box_h // 2)
 
-                    cv2.rectangle(vis, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
-                    cv2.putText(vis, f"LIDAR {dist:.1f}m", (bx1, max(10, by1 - 6)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 2)
+                    label = f"LIDAR {dist:.1f}m"
+                    if lidar_danger:
+                        label += f" [{lidar_danger.upper()}]"
+
+                    cv2.rectangle(vis, (bx1, by1), (bx2, by2), lidar_color, 2)
+                    cv2.putText(vis, label, (bx1, max(10, by1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, lidar_color, 2)
         
         # Draw HUD
         speed = self._get_vehicle_speed()
