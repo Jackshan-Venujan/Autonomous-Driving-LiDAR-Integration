@@ -6,7 +6,7 @@ Current Issues in this commit
 3. Traffic Light model is not accurate, even without the traffic light, it is detecting
 
 
-**Plan: Fix LiDAR DRIVE/SLOW Decision Instability**
+**Plan: Fix LiDAR DRIVE/SLOW Decision Instability** -- Found that this is NOT the problem
 Context
 The driving agent oscillates rapidly between DRIVE and SLOW states when an obstacle sits near the 10 m boundary. This is a classic control chattering problem: LiDAR point-cloud noise causes the measured cluster centroid distance to bounce a few centimetres either side of the threshold on every frame, flipping obstacle_action every cycle and producing erratic throttle/brake behaviour.
 
