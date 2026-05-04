@@ -26,9 +26,11 @@ from core.carla_spawner import CarlaSpawner
 from detection.yolo_lane_filter import YOLOLaneFilter
 
 # LiDAR integration
+import numpy as np
 from core.lidar_processor import LidarProcessor
 from core.lidar_obstacle_detector import LidarObstacleDetector, ACTION_PRIORITY
 from core.lidar_fusion import LidarFusion
+from core.temporal_obstacle_detector import TemporalObstacleDetector
 
 # Control parameters - Tuned for smooth steering at 15 km/h
 PID_KP, PID_KI, PID_KD = 0.45, 0.015, 0.28  # Lower P, higher D for smoother response
@@ -59,6 +61,7 @@ class DrivingAgent:
         self.lidar_processor = LidarProcessor() if lidar_sensor else None
         self.lidar_obstacle_detector = LidarObstacleDetector() if lidar_sensor else None
         self.lidar_fusion = LidarFusion() if lidar_sensor else None
+        self.temporal_detector = TemporalObstacleDetector() if lidar_sensor else None
         self.show_lidar_view = False  # toggled by [P] key
         
         # Initialize modules
@@ -358,14 +361,17 @@ class DrivingAgent:
             vehicle_speed_kmh=current_speed
         )
 
-        # --- LiDAR pipeline ---
+        # --- LiDAR pipeline (temporal accumulation) ---
         lidar_obstacles = []
         if self.lidar_sensor is not None:
-            raw_pts, _ = self.lidar_sensor.get_latest()
+            raw_pts, lidar_ts = self.lidar_sensor.get_latest()
             if raw_pts is not None:
-                filtered_pts = self.lidar_processor.preprocess(raw_pts)
-                lidar_obstacles = self.lidar_obstacle_detector.detect(
-                    filtered_pts, vehicle_speed_kmh=current_speed
+                T_world = np.array(self.vehicle.get_transform().get_matrix())
+                lidar_obstacles = self.temporal_detector.detect_temporal(
+                    raw_pts,
+                    T_world=T_world,
+                    timestamp=lidar_ts if lidar_ts is not None else 0.0,
+                    vehicle_speed_kmh=current_speed,
                 )
 
         # --- Camera-LiDAR fusion ---
@@ -1023,10 +1029,10 @@ class DrivingAgent:
         print(f"LiDAR BEV view: {'ON' if self.show_lidar_view else 'OFF'}")
 
     def visualize_lidar(self):
-        """Render the LiDAR top-down BEV window when enabled."""
-        if not self.show_lidar_view or self.lidar_obstacle_detector is None:
+        """Render the temporal LiDAR top-down BEV window when enabled."""
+        if not self.show_lidar_view or self.temporal_detector is None:
             return
-        bev = self.lidar_obstacle_detector.render_bev()
+        bev = self.temporal_detector.render_bev_temporal()
         cv2.imshow('LiDAR Top-Down', bev)
 
     def cleanup(self):
