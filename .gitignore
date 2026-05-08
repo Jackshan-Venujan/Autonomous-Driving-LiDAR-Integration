@@ -63,6 +63,7 @@ results/
 _out/
 *.tmp
 *.cache
+.metrics/Older
 
 # OS generated files
 .DS_Store

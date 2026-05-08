@@ -1,0 +1,8 @@
+metric,camera,lidar_bbox
+MAE_m,N/A,N/A
+RMSE_m,N/A,N/A
+MAPE_pct,N/A,N/A
+detection_rate,1.0000,0.4200
+mean_latency_ms,21.2275,2.4740
+n_samples,200,200
+winner,N/A,-

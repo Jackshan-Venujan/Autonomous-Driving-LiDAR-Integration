@@ -161,6 +161,10 @@ class AutonomousDrivingSystem:
                 # Toggle LiDAR BEV window
                 elif key == ord('p'):
                     self.agent.toggle_lidar_view()
+
+                # Toggle distance metrics window
+                elif key == ord('g'):
+                    self.agent.toggle_metrics_view()
                 
                 # NEW: Toggle lead vehicle
                 elif key == ord('t'):
@@ -197,6 +201,9 @@ class AutonomousDrivingSystem:
 
                 # LiDAR BEV window (toggled by [P])
                 self.agent.visualize_lidar()
+
+                # Distance metrics window (toggled by [G])
+                self.agent.visualize_metrics()
                 
                 # Status
                 if frame_count % 100 == 0:

@@ -60,6 +60,11 @@ class DrivingAgent:
         self.lidar_obstacle_detector = LidarObstacleDetector() if lidar_sensor else None
         self.lidar_fusion = LidarFusion() if lidar_sensor else None
         self.show_lidar_view = False  # toggled by [P] key
+
+        # Distance metrics logger
+        from core.distance_metrics import DistanceMetricsLogger
+        self.distance_metrics = DistanceMetricsLogger(output_dir='./metrics') if lidar_sensor else None
+        self.show_metrics_view = False  # toggled by [G] key
         
         # Initialize modules
         self.lane_detector = LaneDetector()
@@ -334,8 +339,10 @@ class DrivingAgent:
         # Get current speed for adaptive detection
         current_speed = self._get_vehicle_speed()
         
+        _t_cam0 = time.perf_counter()
         all_detections, _ = self.obstacle_detector.detect(image, vehicle_speed_kmh=current_speed)
-        
+        self._cam_latency_ms = (time.perf_counter() - _t_cam0) * 1000.0
+
         # CREATE LANE MASK with TRIANGULAR ROI
         # Single lane: Fixed-width trapezoid prevents adjacent lane false positives
         # Dual lanes: Uses actual boundaries for accurate filtering
@@ -360,6 +367,8 @@ class DrivingAgent:
 
         # --- LiDAR pipeline ---
         lidar_obstacles = []
+        filtered_pts = None
+        t_lidar_start = time.perf_counter()
         if self.lidar_sensor is not None:
             raw_pts, _ = self.lidar_sensor.get_latest()
             if raw_pts is not None:
@@ -367,6 +376,7 @@ class DrivingAgent:
                 lidar_obstacles = self.lidar_obstacle_detector.detect(
                     filtered_pts, vehicle_speed_kmh=current_speed
                 )
+        lidar_latency_ms = (time.perf_counter() - t_lidar_start) * 1000.0
 
         # --- Camera-LiDAR fusion ---
         if self.lidar_sensor is not None and lidar_obstacles is not None:
@@ -378,19 +388,32 @@ class DrivingAgent:
                 vehicle_speed_kmh=current_speed,
                 img_width=self.lane_detector.img_w,
                 focal_length_px=focal_px,
+                lidar_raw_points=filtered_pts,
             )
             # Terminal log when any obstacle is present
             cam_d = self.lidar_fusion.last_camera_dist
             lid_d = self.lidar_fusion.last_lidar_dist
+            pts_n = self.lidar_fusion.last_lidar_bbox_pts
             if cam_d is not None or lid_d is not None:
                 cam_str = f"{cam_d:.1f}m" if cam_d is not None else "---"
-                lid_str = f"{lid_d:.1f}m" if lid_d is not None else "---"
+                lid_str = f"{lid_d:.1f}m[{pts_n}pts]" if lid_d is not None else "---"
                 nearest_cls = nearest_obstacle.get('class', '?') if nearest_obstacle else '?'
                 print(
                     f"[FRAME {self.frame_count}] "
                     f"CAM={cam_str}({camera_action}) "
                     f"LIDAR={lid_str}({self.lidar_fusion.last_lidar_front_action}) "
                     f"FUSED={obstacle_action}  obj={nearest_cls}"
+                )
+
+            # --- Metrics logging ---
+            if self.distance_metrics is not None:
+                gt_dist = self._get_nearest_front_vehicle_gt_dist()
+                self.distance_metrics.update(
+                    cam_dist=self.lidar_fusion.last_camera_dist,
+                    lidar_bbox_dist=self.lidar_fusion.last_lidar_dist,
+                    gt_dist=gt_dist,
+                    cam_latency_ms=getattr(self, '_cam_latency_ms', 0.0),
+                    lidar_latency_ms=lidar_latency_ms,
                 )
         else:
             # No LiDAR — camera only
@@ -821,6 +844,42 @@ class DrivingAgent:
         speed_ms = vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z
         return speed_ms * 3.6
     
+    def _get_nearest_front_vehicle_gt_dist(self) -> float:
+        """Return CARLA ground-truth distance to the nearest vehicle in front.
+
+        Falls back to the explicitly-spawned lead vehicle when it is active,
+        then queries all CARLA vehicle actors and picks the closest one that
+        is ahead of the ego (positive dot product with forward vector) within
+        60 m.  Returns None when no vehicle is found.
+        """
+        # Prefer the explicitly-spawned lead vehicle (most accurate for controlled tests)
+        lead_status = self.lead_vehicle.get_status()
+        if lead_status and lead_status.get('distance') is not None:
+            return lead_status['distance']
+
+        # Fallback: nearest vehicle actor in front of ego
+        import math
+        ego_tf = self.vehicle.get_transform()
+        ego_loc = ego_tf.location
+        fwd = ego_tf.get_forward_vector()
+        min_dist = float('inf')
+        try:
+            for actor in self.world.get_actors().filter('vehicle.*'):
+                if actor.id == self.vehicle.id:
+                    continue
+                aloc = actor.get_location()
+                dx = aloc.x - ego_loc.x
+                dy = aloc.y - ego_loc.y
+                dot = dx * fwd.x + dy * fwd.y  # positive = in front
+                if dot < 1.0:            # must be at least 1 m ahead
+                    continue
+                dist = ego_loc.distance(aloc)
+                if dist < min_dist and dist < 60.0:
+                    min_dist = dist
+        except Exception:
+            return None
+        return min_dist if min_dist < float('inf') else None
+
     def toggle_lane_mask_visualization(self):
         """Toggle lane mask visualization"""
         self.show_lane_mask = not self.show_lane_mask
@@ -877,21 +936,33 @@ class DrivingAgent:
             camera_dets = [d for d in obs_data['lane_detections'] if d.get('bbox') is not None]
             vis = self.obstacle_detector.visualize(vis, camera_dets, None)
 
-            # --- LiDAR distance overlay on matched detections ---
+            # --- Per-bbox LiDAR distance overlay ---
             for det in obs_data['lane_detections']:
                 lidar_dist = det.get('lidar_distance')
                 fusion_method = det.get('fusion_method', 'CAMERA_ONLY')
                 bbox = det.get('bbox')
                 cam_dist = det.get('distance')
+                bbox_pts = det.get('lidar_bbox_pts', 0)
 
-                if fusion_method == 'FULL' and bbox is not None and lidar_dist is not None:
-                    x1, y1 = int(bbox[0]), int(bbox[1])
-                    cam_lbl = f"CAM:{cam_dist:.1f}m" if cam_dist else "CAM:---"
-                    lid_lbl = f"LIDAR:{lidar_dist:.1f}m"
-                    cv2.putText(vis, cam_lbl, (x1, max(0, y1 - 42)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 200, 255), 2)
-                    cv2.putText(vis, lid_lbl, (x1, max(0, y1 - 26)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 200), 2)
+                if bbox is not None:
+                    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                    # Camera distance (above box, cyan)
+                    if cam_dist is not None:
+                        cv2.putText(vis, f"CAM:{cam_dist:.1f}m",
+                                    (x1, max(0, y1 - 40)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 200, 255), 2)
+                    # LiDAR distance (above box, green) — shown for any matched fusion method
+                    if lidar_dist is not None and fusion_method in ('FULL_BBOX', 'FULL_ANGLE', 'FULL'):
+                        pts_tag = f"[{bbox_pts}p]" if bbox_pts > 0 else "[A]"  # [A]=angle fallback
+                        lid_color = (0, 255, 100) if fusion_method == 'FULL_BBOX' else (0, 200, 150)
+                        cv2.putText(vis, f"LiDAR:{lidar_dist:.1f}m{pts_tag}",
+                                    (x1, max(0, y1 - 22)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, lid_color, 2)
+                    elif lidar_dist is None:
+                        # Show that no LiDAR match was found for this box
+                        cv2.putText(vis, "LiDAR:---",
+                                    (x1, max(0, y1 - 22)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (80, 80, 80), 1)
 
                 # LiDAR-only obstacles (no camera bbox)
                 elif fusion_method == 'LIDAR_ONLY' and bbox is None:
@@ -985,8 +1056,10 @@ class DrivingAgent:
             cv2.putText(vis, cam_str, (8, panel_y + 24),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 200, 255), 2)
 
-            # LiDAR row
-            lid_str = f"LIDAR dist: {lid_dist:.1f}m  ->  {lid_act.upper()}" if lid_dist is not None \
+            # LiDAR row (with bbox point count)
+            _bbox_pts = self.lidar_fusion.last_lidar_bbox_pts if self.lidar_fusion else 0
+            _pts_tag = f"[{_bbox_pts}pts]" if _bbox_pts > 0 else ""
+            lid_str = f"LIDAR dist: {lid_dist:.1f}m{_pts_tag}  ->  {lid_act.upper()}" if lid_dist is not None \
                       else f"LIDAR dist: ---          ->  {lid_act.upper()}"
             cv2.putText(vis, lid_str, (8, panel_y + 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 255, 180), 2)
@@ -1010,7 +1083,7 @@ class DrivingAgent:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 215, 255), 2)
 
         # Controls help
-        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Lane Mask [T]=Lead Vehicle [P]=LiDAR View [Q]=Quit",
+        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Lane Mask [T]=Lead [P]=LiDAR [G]=Metrics [Q]=Quit",
                    (10, vis.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 2)
 
         return vis, None
@@ -1029,8 +1102,30 @@ class DrivingAgent:
         bev = self.lidar_obstacle_detector.render_bev()
         cv2.imshow('LiDAR Top-Down', bev)
 
+    def visualize_metrics(self):
+        """Render the distance metrics comparison window when enabled (toggle [G])."""
+        if self.show_metrics_view and self.distance_metrics is not None:
+            panel = self.distance_metrics.render_panel()
+            cv2.imshow('Distance Metrics', panel)
+        elif not self.show_metrics_view:
+            cv2.destroyWindow('Distance Metrics')
+
+    def toggle_metrics_view(self):
+        """Toggle the distance metrics window (hotkey [G])."""
+        self.show_metrics_view = not self.show_metrics_view
+        if not self.show_metrics_view:
+            cv2.destroyWindow('Distance Metrics')
+        print(f"Metrics view: {'ON' if self.show_metrics_view else 'OFF'}")
+
     def cleanup(self):
         """Cleanup resources"""
+        # Flush metrics CSV before destroying sensors
+        if self.distance_metrics is not None:
+            try:
+                self.distance_metrics.close()
+            except Exception:
+                pass
+
         # Cleanup lead vehicle first
         self.lead_vehicle.destroy()
 
