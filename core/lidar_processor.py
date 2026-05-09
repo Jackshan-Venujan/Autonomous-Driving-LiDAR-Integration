@@ -56,3 +56,38 @@ class LidarProcessor:
         xyz = xyz[mask]
 
         return xyz
+
+    def snapshot_forward(
+        self,
+        points_xyz: np.ndarray,
+        half_angle_deg: float = 1.0,
+    ):
+        """Simulate a non-rotating (stopped) LiDAR pointing straight ahead.
+
+        Filters preprocessed points to those within ±half_angle_deg of the
+        forward axis (atan2(y, x) = 0).  With the default 1° this approximates
+        a single fixed-beam rangefinder firing forward.
+
+        Args:
+            points_xyz: (M, 3) output of preprocess().
+            half_angle_deg: half-width of the forward cone in degrees (default 1°).
+
+        Returns:
+            (filtered_xyz, nearest_distance_m)
+            filtered_xyz        — subset of input points inside the cone
+            nearest_distance_m  — horizontal distance to the nearest surviving
+                                  point, or None if the cone is empty.
+        """
+        if len(points_xyz) == 0:
+            return np.zeros((0, 3), dtype=np.float32), None
+
+        # Horizontal bearing from forward axis (+X). 0° = straight ahead.
+        angles_deg = np.degrees(np.arctan2(points_xyz[:, 1], points_xyz[:, 0]))
+        mask = np.abs(angles_deg) <= half_angle_deg
+        filtered = points_xyz[mask]
+
+        if len(filtered) == 0:
+            return filtered, None
+
+        dists = np.sqrt(filtered[:, 0] ** 2 + filtered[:, 1] ** 2)
+        return filtered, float(np.min(dists))

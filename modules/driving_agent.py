@@ -408,12 +408,17 @@ class DrivingAgent:
             # --- Metrics logging ---
             if self.distance_metrics is not None:
                 gt_dist = self._get_nearest_front_vehicle_gt_dist()
+                # Non-rotating snapshot: forward ±1° cone only
+                _, snap_dist = self.lidar_processor.snapshot_forward(
+                    filtered_pts, half_angle_deg=1.0
+                ) if filtered_pts is not None and len(filtered_pts) > 0 else (None, None)
                 self.distance_metrics.update(
                     cam_dist=self.lidar_fusion.last_camera_dist,
                     lidar_bbox_dist=self.lidar_fusion.last_lidar_dist,
                     gt_dist=gt_dist,
                     cam_latency_ms=getattr(self, '_cam_latency_ms', 0.0),
                     lidar_latency_ms=lidar_latency_ms,
+                    lidar_snapshot_dist=snap_dist,
                 )
         else:
             # No LiDAR — camera only
