@@ -30,6 +30,7 @@ htmlcov/
 # Logs
 *.log
 logs/
+./metrics
 
 # Build / packaging
 build/

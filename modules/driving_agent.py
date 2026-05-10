@@ -408,13 +408,22 @@ class DrivingAgent:
             # --- Metrics logging ---
             if self.distance_metrics is not None:
                 gt_dist = self._get_nearest_front_vehicle_gt_dist()
+                cam_lat = getattr(self, '_cam_latency_ms', 0.0)
                 self.distance_metrics.update(
                     cam_dist=self.lidar_fusion.last_camera_dist,
                     lidar_bbox_dist=self.lidar_fusion.last_lidar_dist,
                     gt_dist=gt_dist,
-                    cam_latency_ms=getattr(self, '_cam_latency_ms', 0.0),
+                    cam_latency_ms=cam_lat,
                     lidar_latency_ms=lidar_latency_ms,
                 )
+                if fused_detections:
+                    self.distance_metrics.log_obstacles(
+                        frame_n=self.frame_count,
+                        fused_detections=fused_detections,
+                        gt_dist=gt_dist,
+                        cam_latency_ms=cam_lat,
+                        lidar_latency_ms=lidar_latency_ms,
+                    )
         else:
             # No LiDAR — camera only
             fused_detections = lane_detections

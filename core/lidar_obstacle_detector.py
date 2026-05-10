@@ -38,6 +38,7 @@ class LidarObstacle:
     bbox_max_y: float = 0.0
     bbox_min_z: float = 0.0  # lowest Z across accumulated point history (obstacle bottom)
     bbox_max_z: float = 0.0  # highest Z across accumulated point history (obstacle top)
+    track_id: str = ""       # persistent track ID assigned by LidarObstacleDetector
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +283,7 @@ class LidarObstacleDetector:
                 bbox_max_y=float(np.max(accumulated[:, 1])),
                 bbox_min_z=acc_min_z,
                 bbox_max_z=acc_max_z,
+                track_id=tid,
             ))
 
         # Evict stale tracks (point_history is freed automatically on deletion)

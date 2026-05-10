@@ -28,6 +28,9 @@ def _higher_action(a: str, b: str) -> str:
 
 class LidarFusion:
 
+    _CAM_STALE_MAX = 5    # evict a camera-only track after this many frames unseen
+    _CAM_MATCH_PX  = 150  # max pixel distance for camera-only re-identification
+
     def __init__(self, angle_match_threshold_deg: float = 15.0):
         self.angle_match_threshold = angle_match_threshold_deg
         self.projector = LidarCameraProjector()  # defaults match sensor setup
@@ -40,9 +43,40 @@ class LidarFusion:
         self.last_fused_action: str = 'drive'
         self.last_lidar_bbox_pts: int = 0  # point count from bbox projection
 
+        # Camera-only obstacle tracker (persistent IDs for unmatched camera detections)
+        self._cam_only_tracks: Dict[str, dict] = {}  # cam_id → {bbox_center, last_frame}
+        self._next_cam_id: int = 0
+        self._fuse_frame: int = 0
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _match_or_create_cam_track(self, bbox_center: Tuple[int, int]) -> str:
+        """Return a persistent camera-only obstacle ID for this bbox centre.
+
+        Nearest-neighbour match in pixel space; creates a new ID when no
+        existing track is within _CAM_MATCH_PX pixels.
+        """
+        best_id: Optional[str] = None
+        best_dist = float('inf')
+        for cid, ctrack in self._cam_only_tracks.items():
+            dx = bbox_center[0] - ctrack['bbox_center'][0]
+            dy = bbox_center[1] - ctrack['bbox_center'][1]
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist < self._CAM_MATCH_PX and dist < best_dist:
+                best_dist = dist
+                best_id = cid
+
+        if best_id is None:
+            best_id = f'cam_{self._next_cam_id}'
+            self._next_cam_id += 1
+
+        self._cam_only_tracks[best_id] = {
+            'bbox_center': bbox_center,
+            'last_frame': self._fuse_frame,
+        }
+        return best_id
 
     @staticmethod
     def _camera_angle(detection: Dict, img_width: int, focal_length_px: float) -> float:
@@ -91,6 +125,12 @@ class LidarFusion:
         """
         self.last_camera_action = camera_action
 
+        # Advance frame counter and evict stale camera-only tracks
+        self._fuse_frame += 1
+        for cid in list(self._cam_only_tracks.keys()):
+            if self._fuse_frame - self._cam_only_tracks[cid]['last_frame'] > self._CAM_STALE_MAX:
+                del self._cam_only_tracks[cid]
+
         # Reset per-call state
         self.last_camera_dist = None
         self.last_lidar_dist = None
@@ -121,6 +161,9 @@ class LidarFusion:
                         lidar_raw_points, bbox, min_points=3
                     )
 
+            cam_angle = self._camera_angle(det, img_width, focal_length_px)
+            obstacle_id: Optional[str] = None
+
             if bbox_dist is not None:
                 fusion_method = 'FULL_BBOX'
                 enriched['lidar_distance'] = bbox_dist
@@ -130,10 +173,20 @@ class LidarFusion:
                     self.last_lidar_dist = bbox_dist
                 if bbox_pts > self.last_lidar_bbox_pts:
                     self.last_lidar_bbox_pts = bbox_pts
+                # Assign the LiDAR track ID whose angle best matches this camera detection
+                best_angle_obs: Optional[LidarObstacle] = None
+                best_angle_diff = float('inf')
+                for obs in front_obstacles:
+                    diff = abs(obs.angle_deg - cam_angle)
+                    if diff < self.angle_match_threshold and diff < best_angle_diff:
+                        best_angle_diff = diff
+                        best_angle_obs = obs
+                if best_angle_obs is not None:
+                    obstacle_id = best_angle_obs.track_id
+                    matched_lidar_ids.add(id(best_angle_obs))
 
             else:
                 # --- Strategy B: Angle-based fallback ---
-                cam_angle = self._camera_angle(det, img_width, focal_length_px)
                 best_obs: Optional[LidarObstacle] = None
                 best_diff = float('inf')
                 for obs in front_obstacles:
@@ -148,6 +201,7 @@ class LidarFusion:
                     enriched['lidar_distance'] = best_obs.distance
                     enriched['lidar_danger'] = best_obs.danger_level
                     enriched['lidar_bbox_pts'] = 0
+                    obstacle_id = best_obs.track_id
                     if self.last_lidar_dist is None or best_obs.distance < self.last_lidar_dist:
                         self.last_lidar_dist = best_obs.distance
                 else:
@@ -155,6 +209,12 @@ class LidarFusion:
                     enriched['lidar_danger'] = None
                     enriched['lidar_bbox_pts'] = 0
 
+            # Camera-only: assign persistent camera-side ID
+            if obstacle_id is None:
+                bbox_center = det.get('bbox_center', (0, 0))
+                obstacle_id = self._match_or_create_cam_track(bbox_center)
+
+            enriched['obstacle_id'] = obstacle_id
             enriched['fusion_method'] = fusion_method
 
             if cam_dist is not None:
@@ -188,6 +248,7 @@ class LidarFusion:
                 'in_lane': True,
                 'sector': obs.sector,
                 'angle_deg': obs.angle_deg,
+                'obstacle_id': obs.track_id,
             }
             fused_detections.append(lidar_only)
 
