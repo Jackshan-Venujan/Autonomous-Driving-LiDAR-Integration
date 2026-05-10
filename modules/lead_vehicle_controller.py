@@ -180,26 +180,46 @@ class LeadVehicleController:
         return max(-1.0, min(1.0, steer))
     
     def get_status(self):
-        """Get status for display"""
+        """Get status for display.
+
+        `distance` is the bumper-to-bumper longitudinal gap (ego front bumper →
+        lead rear bumper), the standard ADAS following-distance reference. The
+        previous 3D centre-to-centre Euclidean distance is also returned as
+        `distance_centre` for diagnostics.
+        """
         if not self.enabled or self.lead_vehicle is None:
             return None
-        
+
         try:
-            ego_loc = self.ego_vehicle.get_transform().location
+            ego_tf = self.ego_vehicle.get_transform()
+            ego_loc = ego_tf.location
+            fwd = ego_tf.get_forward_vector()
             lead_loc = self.lead_vehicle.get_transform().location
-            distance = ego_loc.distance(lead_loc)
-            
+
+            dx = lead_loc.x - ego_loc.x
+            dy = lead_loc.y - ego_loc.y
+            fwd_dist = dx * fwd.x + dy * fwd.y
+
+            ego_half_len = self.ego_vehicle.bounding_box.extent.x
+            lead_half_len = self.lead_vehicle.bounding_box.extent.x
+            gap = fwd_dist - ego_half_len - lead_half_len
+
             velocity = self.lead_vehicle.get_velocity()
             speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-            
+
             return {
-                'distance': distance,
+                'distance': gap,
+                'distance_centre': fwd_dist,
                 'speed': speed,
                 'target_speed': self.current_target_speed,
                 'mode': self.behavior_mode
             }
         except:
             return None
+
+    def get_actor(self):
+        """Return the spawned lead vehicle actor (or None if not enabled)."""
+        return self.lead_vehicle if self.enabled else None
     
     def destroy(self):
         """Clean up lead vehicle"""

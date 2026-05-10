@@ -61,9 +61,21 @@ class DrivingAgent:
         self.lidar_fusion = LidarFusion() if lidar_sensor else None
         self.show_lidar_view = False  # toggled by [P] key
 
-        # Distance metrics logger
+        # Distance metrics logger.
+        # Sensors are mounted at x=2.0 m (main.py), but the GT is referenced
+        # at the ego front bumper (x = ego half-length). The constant below
+        # converts sensor-origin distances into the bumper-to-bumper frame.
         from core.distance_metrics import DistanceMetricsLogger
-        self.distance_metrics = DistanceMetricsLogger(output_dir='./metrics') if lidar_sensor else None
+        if lidar_sensor:
+            ego_half_len = self.vehicle.bounding_box.extent.x
+            lidar_x = 2.0  # matches main.py LiDAR/camera mount transforms
+            sensor_to_bumper_offset_m = lidar_x - ego_half_len
+            self.distance_metrics = DistanceMetricsLogger(
+                output_dir='./metrics',
+                sensor_to_bumper_offset_m=sensor_to_bumper_offset_m,
+            )
+        else:
+            self.distance_metrics = None
         self.show_metrics_view = False  # toggled by [G] key
         
         # Initialize modules
@@ -420,10 +432,12 @@ class DrivingAgent:
                     lidar_latency_ms=lidar_latency_ms,
                 )
                 if fused_detections:
+                    per_obs_gt = self._per_obstacle_gt(fused_detections)
                     self.distance_metrics.log_obstacles(
                         frame_n=self.frame_count,
                         fused_detections=fused_detections,
                         gt_dist=gt_dist,
+                        per_obstacle_gt=per_obs_gt,
                         cam_latency_ms=cam_lat,
                         lidar_latency_ms=lidar_latency_ms,
                     )
@@ -856,25 +870,88 @@ class DrivingAgent:
         speed_ms = vel.x * fwd.x + vel.y * fwd.y + vel.z * fwd.z
         return speed_ms * 3.6
     
+    def _per_obstacle_gt(self, fused_detections):
+        """Map each fused detection's `obstacle_id` to the bumper-to-bumper GT
+        distance of the matching CARLA vehicle actor.
+
+        Each fused detection is matched to the nearest CARLA vehicle by
+        (angular bearing, longitudinal distance) in ego frame. Detections with
+        no consistent CARLA actor get GT = None so the metrics logger leaves
+        their error fields blank instead of stamping the lead-vehicle distance
+        across every row.
+        """
+        import math
+        ego_tf = self.vehicle.get_transform()
+        ego_loc = ego_tf.location
+        fwd = ego_tf.get_forward_vector()
+        ego_half_len = self.vehicle.bounding_box.extent.x
+
+        actors = []
+        try:
+            for a in self.world.get_actors().filter('vehicle.*'):
+                if a.id == self.vehicle.id:
+                    continue
+                aloc = a.get_location()
+                dx = aloc.x - ego_loc.x
+                dy = aloc.y - ego_loc.y
+                fwd_d = dx * fwd.x + dy * fwd.y
+                lat = -dx * fwd.y + dy * fwd.x
+                if fwd_d < 0.5 or fwd_d > 80.0:
+                    continue
+                ang = math.degrees(math.atan2(lat, fwd_d))
+                gap = fwd_d - ego_half_len - a.bounding_box.extent.x
+                actors.append({'fwd': fwd_d, 'ang': ang, 'gap': gap})
+        except Exception:
+            return {}
+
+        out = {}
+        for det in fused_detections:
+            oid = det.get('obstacle_id')
+            if not oid:
+                continue
+            det_ang = det.get('angle_deg')
+            det_dist = det.get('lidar_distance') or det.get('distance')
+            if det_ang is None or det_dist is None or not actors:
+                out[oid] = None
+                continue
+            best = None
+            best_score = float('inf')
+            for a in actors:
+                ang_diff = abs(a['ang'] - det_ang)
+                if ang_diff >= 8.0:
+                    continue
+                score = ang_diff + 0.3 * abs(a['fwd'] - det_dist)
+                if score < best_score:
+                    best_score = score
+                    best = a
+            out[oid] = best['gap'] if best is not None else None
+        return out
+
     def _get_nearest_front_vehicle_gt_dist(self) -> float:
         """Return CARLA ground-truth distance to the nearest vehicle in front.
 
-        Falls back to the explicitly-spawned lead vehicle when it is active,
-        then queries all CARLA vehicle actors and picks the closest one that
-        is ahead of the ego (positive dot product with forward vector) within
-        60 m.  Returns None when no vehicle is found.
+        Returns the bumper-to-bumper longitudinal gap (ego front bumper → lead
+        rear bumper) — the same convention used by `lead_vehicle_controller.
+        get_status()` so all GT paths are comparable.
+
+        Prefers the explicitly-spawned lead vehicle when active, then queries
+        all CARLA vehicle actors and picks the closest in-lane one ahead of
+        the ego (lateral offset ≤ 3 m, longitudinal distance ≤ 60 m). Returns
+        None when no vehicle is found.
         """
         # Prefer the explicitly-spawned lead vehicle (most accurate for controlled tests)
         lead_status = self.lead_vehicle.get_status()
         if lead_status and lead_status.get('distance') is not None:
             return lead_status['distance']
 
-        # Fallback: nearest vehicle actor in front of ego
+        # Fallback: nearest in-lane vehicle actor in front of ego (bumper-to-bumper gap)
         import math
         ego_tf = self.vehicle.get_transform()
         ego_loc = ego_tf.location
         fwd = ego_tf.get_forward_vector()
-        min_dist = float('inf')
+        ego_half_len = self.vehicle.bounding_box.extent.x
+
+        min_gap = float('inf')
         try:
             for actor in self.world.get_actors().filter('vehicle.*'):
                 if actor.id == self.vehicle.id:
@@ -882,15 +959,17 @@ class DrivingAgent:
                 aloc = actor.get_location()
                 dx = aloc.x - ego_loc.x
                 dy = aloc.y - ego_loc.y
-                dot = dx * fwd.x + dy * fwd.y  # positive = in front
-                if dot < 1.0:            # must be at least 1 m ahead
+                fwd_dist = dx * fwd.x + dy * fwd.y               # longitudinal centre-to-centre
+                lateral = abs(-dx * fwd.y + dy * fwd.x)          # perpendicular offset
+                if fwd_dist < 1.0 or lateral > 3.0:              # ≥ 1 m ahead AND in our lane
                     continue
-                dist = ego_loc.distance(aloc)
-                if dist < min_dist and dist < 60.0:
-                    min_dist = dist
+                actor_half_len = actor.bounding_box.extent.x
+                gap = fwd_dist - ego_half_len - actor_half_len
+                if 0 < gap < min_gap and fwd_dist < 60.0:
+                    min_gap = gap
         except Exception:
             return None
-        return min_dist if min_dist < float('inf') else None
+        return min_gap if min_gap < float('inf') else None
 
     def toggle_lane_mask_visualization(self):
         """Toggle lane mask visualization"""

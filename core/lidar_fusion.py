@@ -158,7 +158,7 @@ class LidarFusion:
                 bbox = det.get('bbox')
                 if bbox is not None:
                     bbox_dist, bbox_pts = self.projector.filter_by_bbox(
-                        lidar_raw_points, bbox, min_points=3
+                        lidar_raw_points, bbox, min_points=2
                     )
 
             cam_angle = self._camera_angle(det, img_width, focal_length_px)
@@ -186,13 +186,22 @@ class LidarFusion:
                     matched_lidar_ids.add(id(best_angle_obs))
 
             else:
-                # --- Strategy B: Angle-based fallback ---
+                # --- Strategy B: Angle-based fallback (distance-aware) ---
+                # Require both angular AND distance agreement, else the matched
+                # cluster is a different physical object that just happens to
+                # share an angular bearing with the camera detection.
                 best_obs: Optional[LidarObstacle] = None
                 best_diff = float('inf')
                 for obs in front_obstacles:
-                    diff = abs(obs.angle_deg - cam_angle)
-                    if diff < self.angle_match_threshold and diff < best_diff:
-                        best_diff = diff
+                    ang_diff = abs(obs.angle_deg - cam_angle)
+                    if ang_diff >= self.angle_match_threshold:
+                        continue
+                    if cam_dist is not None:
+                        rel = abs(obs.distance - cam_dist) / max(cam_dist, 1.0)
+                        if rel > 0.40:
+                            continue
+                    if ang_diff < best_diff:
+                        best_diff = ang_diff
                         best_obs = obs
 
                 if best_obs is not None:
@@ -216,6 +225,7 @@ class LidarFusion:
 
             enriched['obstacle_id'] = obstacle_id
             enriched['fusion_method'] = fusion_method
+            enriched['angle_deg'] = cam_angle
 
             if cam_dist is not None:
                 if self.last_camera_dist is None or cam_dist < self.last_camera_dist:

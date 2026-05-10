@@ -21,8 +21,17 @@ import numpy as np
 
 class DistanceMetricsLogger:
 
-    def __init__(self, output_dir: str = './metrics', window_size: int = 200):
+    def __init__(
+        self,
+        output_dir: str = './metrics',
+        window_size: int = 200,
+        sensor_to_bumper_offset_m: float = 0.0,
+    ):
         self.output_dir = output_dir
+        # Constant added to camera/LiDAR distances so they are referenced from
+        # the ego front bumper instead of the sensor mount, matching the
+        # bumper-to-bumper convention used by the GT.
+        self.sensor_to_bumper_offset_m = sensor_to_bumper_offset_m
         os.makedirs(output_dir, exist_ok=True)
 
         ts = time.strftime('%Y%m%d_%H%M%S')
@@ -64,6 +73,9 @@ class DistanceMetricsLogger:
 
     # ------------------------------------------------------------------
 
+    def _to_bumper(self, d: Optional[float]) -> Optional[float]:
+        return None if d is None else d + self.sensor_to_bumper_offset_m
+
     def update(
         self,
         cam_dist: Optional[float],
@@ -74,6 +86,11 @@ class DistanceMetricsLogger:
     ) -> None:
         self._frame += 1
         ts = time.perf_counter() - self._start_time
+
+        # Reference camera/LiDAR distances to the ego front bumper before
+        # comparing against the bumper-to-bumper GT.
+        cam_dist = self._to_bumper(cam_dist)
+        lidar_bbox_dist = self._to_bumper(lidar_bbox_dist)
 
         cam_err = abs(cam_dist - gt_dist) if (cam_dist is not None and gt_dist is not None) else None
         lid_err = abs(lidar_bbox_dist - gt_dist) if (lidar_bbox_dist is not None and gt_dist is not None) else None
@@ -161,6 +178,7 @@ class DistanceMetricsLogger:
         frame_n: int,
         fused_detections: List[Dict],
         gt_dist: Optional[float] = None,
+        per_obstacle_gt: Optional[Dict[str, Optional[float]]] = None,
         cam_latency_ms: float = 0.0,
         lidar_latency_ms: float = 0.0,
     ) -> None:
@@ -168,7 +186,9 @@ class DistanceMetricsLogger:
 
         Each row contains the independent camera distance and LiDAR distance
         for the same physical obstacle (identified by obstacle_id), alongside
-        ground-truth and derived error metrics.
+        ground-truth and derived error metrics. When `per_obstacle_gt` is
+        provided, GT is resolved per-row from the matching CARLA actor;
+        otherwise the single `gt_dist` is used for all rows.
         """
         ts = time.perf_counter() - self._start_time
 
@@ -187,16 +207,24 @@ class DistanceMetricsLogger:
             else:
                 detection_source = 'CAM_ONLY'
 
-            # Raw per-sensor distances (never fused)
-            cam_dist   = det.get('distance')         # camera monocular estimate
-            lidar_dist = det.get('lidar_distance')   # LiDAR cluster distance
+            # Raw per-sensor distances → bumper-to-bumper frame
+            cam_dist   = self._to_bumper(det.get('distance'))
+            lidar_dist = self._to_bumper(det.get('lidar_distance'))
+
+            # Per-row GT: prefer the per-obstacle map (matches each detection
+            # to its CARLA actor); fall back to the frame-level lead-vehicle
+            # gt_dist when no map is provided.
+            if per_obstacle_gt is not None:
+                row_gt = per_obstacle_gt.get(obstacle_id)
+            else:
+                row_gt = gt_dist
 
             # Error metrics (only when GT is available)
-            cam_err   = abs(cam_dist   - gt_dist) if (cam_dist   is not None and gt_dist is not None) else None
-            lidar_err = abs(lidar_dist - gt_dist) if (lidar_dist is not None and gt_dist is not None) else None
+            cam_err   = abs(cam_dist   - row_gt) if (cam_dist   is not None and row_gt is not None) else None
+            lidar_err = abs(lidar_dist - row_gt) if (lidar_dist is not None and row_gt is not None) else None
 
-            cam_rel_pct   = (cam_err   / gt_dist * 100.0) if (cam_err   is not None and gt_dist > 0) else None
-            lidar_rel_pct = (lidar_err / gt_dist * 100.0) if (lidar_err is not None and gt_dist > 0) else None
+            cam_rel_pct   = (cam_err   / row_gt * 100.0) if (cam_err   is not None and row_gt is not None and row_gt > 0) else None
+            lidar_rel_pct = (lidar_err / row_gt * 100.0) if (lidar_err is not None and row_gt is not None and row_gt > 0) else None
 
             cam_w1m   = (1 if cam_err   <= 1.0 else 0) if cam_err   is not None else ''
             lidar_w1m = (1 if lidar_err <= 1.0 else 0) if lidar_err is not None else ''
@@ -212,7 +240,7 @@ class DistanceMetricsLogger:
                 'detection_source': detection_source,
                 'cam_dist':         cam_dist,
                 'lidar_dist':       lidar_dist,
-                'gt_dist':          gt_dist,
+                'gt_dist':          row_gt,
                 'cam_err':          cam_err,
                 'lidar_err':        lidar_err,
                 'cam_rel_pct':      cam_rel_pct,
@@ -235,7 +263,7 @@ class DistanceMetricsLogger:
                 detection_source,
                 _f(cam_dist),
                 _f(lidar_dist),
-                _f(gt_dist),
+                _f(row_gt),
                 _f(cam_err),
                 _f(lidar_err),
                 _f(cam_rel_pct),
