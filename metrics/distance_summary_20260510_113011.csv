@@ -1,0 +1,25 @@
+metric,camera,lidar_bbox
+MAE_m,4.3228,4.2941
+RMSE_m,4.6785,4.4377
+MAPE_pct,32.9121,29.3756
+detection_rate,1.0000,0.2700
+mean_latency_ms,14.5130,1.1324
+n_frame_samples,200,200
+MAE_winner,TIE,-
+
+--- per-obstacle metrics ---,,
+metric,camera,lidar
+obstacle_MAE_m,4.2813,4.3062
+obstacle_RMSE_m,5.2911,5.7096
+obstacle_95th_pct_error_m,8.0327,7.2262
+within_1m_pct,3.8642,7.1551
+n_obstacle_rows,8333,8333
+
+--- detection source rates (per obstacle row) ---,,
+both_detected_rate,1.0000,-
+cam_detection_rate,1.0000,-
+lidar_detection_rate,1.0000,-
+cam_only_obstacle_rate,0.4398,-
+lidar_only_obstacle_rate,0.4522,-
+note_cam_only_rate,≈ camera FP / LiDAR FN rate,
+note_lidar_only_rate,≈ camera FN / LiDAR FP rate,

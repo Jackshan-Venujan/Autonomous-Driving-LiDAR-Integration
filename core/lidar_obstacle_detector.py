@@ -478,11 +478,14 @@ class LidarObstacleDetector:
             if x1 != x2 and y1 != y2:
                 cv2.rectangle(canvas, (min(x1, x2), min(y1, y2)),
                               (max(x1, x2), max(y1, y2)), color, 2)
-            # Label: distance + danger
+            # Label: distance + danger + track_id
             lx, ly = world_to_px(obs.centroid_x, obs.centroid_y)
             label = f"{obs.distance:.1f}m {obs.danger_level.upper()[:4]}"
             cv2.putText(canvas, label, (max(0, lx - 30), max(10, ly - 4)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1)
+            if obs.track_id:
+                cv2.putText(canvas, obs.track_id, (max(0, lx - 30), max(10, ly + 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
 
         # --- Ego vehicle rectangle ---
         ev_w, ev_h = 8, 14   # pixels

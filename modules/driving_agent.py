@@ -390,20 +390,23 @@ class DrivingAgent:
                 focal_length_px=focal_px,
                 lidar_raw_points=filtered_pts,
             )
-            # Terminal log when any obstacle is present
-            cam_d = self.lidar_fusion.last_camera_dist
-            lid_d = self.lidar_fusion.last_lidar_dist
-            pts_n = self.lidar_fusion.last_lidar_bbox_pts
-            if cam_d is not None or lid_d is not None:
-                cam_str = f"{cam_d:.1f}m" if cam_d is not None else "---"
-                lid_str = f"{lid_d:.1f}m[{pts_n}pts]" if lid_d is not None else "---"
-                nearest_cls = nearest_obstacle.get('class', '?') if nearest_obstacle else '?'
+            # Terminal log — per-obstacle table when any obstacle is present
+            if fused_detections:
+                gt_for_print = self._get_nearest_front_vehicle_gt_dist()
+                gt_str = f"{gt_for_print:.2f}" if gt_for_print is not None else "  ---"
                 print(
-                    f"[FRAME {self.frame_count}] "
-                    f"CAM={cam_str}({camera_action}) "
-                    f"LIDAR={lid_str}({self.lidar_fusion.last_lidar_front_action}) "
-                    f"FUSED={obstacle_action}  obj={nearest_cls}"
+                    f"[FRAME {self.frame_count:04d}]  "
+                    f"fused={obstacle_action}  "
+                    f"speed={current_speed:.1f}km/h"
                 )
+                print(f"  {'ID':<10} {'SOURCE':<14} {'CAM_m':>7} {'LIDAR_m':>8} {'GT_m':>7}  DANGER")
+                for _fd in fused_detections:
+                    _oid    = _fd.get('obstacle_id', '?')
+                    _src    = _fd.get('fusion_method', '?')
+                    _cam    = f"{_fd['distance']:.2f}"      if _fd.get('distance')       is not None else "   ---"
+                    _lid    = f"{_fd['lidar_distance']:.2f}" if _fd.get('lidar_distance') is not None else "   ---"
+                    _dng    = _fd.get('danger_level') or _fd.get('lidar_danger') or '?'
+                    print(f"  {_oid:<10} {_src:<14} {_cam:>7} {_lid:>8} {gt_str:>7}  {_dng}")
 
             # --- Metrics logging ---
             if self.distance_metrics is not None:
@@ -972,13 +975,22 @@ class DrivingAgent:
                         cv2.putText(vis, "LiDAR:---",
                                     (x1, max(0, y1 - 22)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (80, 80, 80), 1)
+                    # Obstacle ID (just above the bbox top edge)
+                    obs_id = det.get('obstacle_id', '')
+                    if obs_id:
+                        id_color = (255, 255, 255) if obs_id.startswith('t') else (160, 160, 160)
+                        cv2.putText(vis, f"[{obs_id}]",
+                                    (x1, max(0, y1 - 4)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, id_color, 1)
 
                 # LiDAR-only obstacles (no camera bbox)
                 elif fusion_method == 'LIDAR_ONLY' and bbox is None:
                     dist = lidar_dist or det.get('distance', 0.0)
                     angle = det.get('angle_deg', 0.0)
                     side = 'R' if angle > 0 else 'L'
-                    lbl = f"[LIDAR-ONLY] unknown  {dist:.1f}m  {angle:+.0f}deg({side})"
+                    obs_id = det.get('obstacle_id', '')
+                    id_tag = f'  [{obs_id}]' if obs_id else ''
+                    lbl = f"[LIDAR-ONLY] unknown  {dist:.1f}m  {angle:+.0f}deg({side}){id_tag}"
                     cv2.putText(vis, lbl, (10, vis.shape[0] - 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
         
