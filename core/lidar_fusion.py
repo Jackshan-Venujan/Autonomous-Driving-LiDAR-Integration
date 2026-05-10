@@ -275,6 +275,9 @@ class LidarFusion:
         nearest: Optional[Dict] = None
         nearest_dist = float('inf')
         for fd in fused_detections:
+            # Safe-by-default fallback: camera distance is used when LiDAR didn't match.
+            # Affects HUD/control only; per-obstacle log keeps sources separate.
+            # See docs/SENSOR_COMPARISON.md before using this for accuracy comparisons.
             eff_dist = fd.get('lidar_distance') or fd.get('distance') or float('inf')
             if eff_dist < nearest_dist:
                 nearest_dist = eff_dist
