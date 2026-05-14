@@ -56,8 +56,8 @@ class LidarObstacleDetector:
 
     def __init__(
         self,
-        eps: float = 0.5,
-        min_samples: int = 3,
+        eps: float = 0.4,
+        min_samples: int = 10,
         base_emergency_dist: float = 3,         # 7.5
         base_stop_dist: float = 5.0,            # 15.0
         base_slow_dist: float = 10.0,           # 20.0

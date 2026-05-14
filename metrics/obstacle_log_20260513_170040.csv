@@ -1,0 +1,1 @@
+frame,timestamp_s,obstacle_id,detection_source,cam_dist_m,lidar_dist_m,gt_dist_m,cam_error_m,lidar_error_m,cam_rel_error_pct,lidar_rel_error_pct,cam_within_1m,lidar_within_1m,cam_latency_ms,lidar_latency_ms,danger_level,angle_deg,sector,match_method
