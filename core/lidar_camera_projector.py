@@ -117,6 +117,47 @@ class LidarCameraProjector:
         return u[in_image], v[in_image], xf[in_image], valid
 
     # ------------------------------------------------------------------
+    # Unclipped projection (for wireframe overlays whose edges may exit
+    # the image frame — cv2.line clips off-screen pixels on its own).
+    # ------------------------------------------------------------------
+
+    def project_xyz_unclipped(
+        self, lidar_xyz: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Project points keeping all in-front projections, even outside the image.
+
+        Args:
+            lidar_xyz: (N, 3) float32 array in LiDAR sensor frame.
+
+        Returns:
+            u        : (N,) pixel column, NaN where the point is not in front.
+            v        : (N,) pixel row,    NaN where the point is not in front.
+            in_front : (N,) bool mask — True for points ahead of the camera.q
+        """
+        n = 0 if lidar_xyz is None else len(lidar_xyz)
+        if n == 0:
+            empty = np.zeros(0, dtype=np.float32)
+            return empty, empty, np.zeros(0, dtype=bool)
+
+        x_l = lidar_xyz[:, 0]
+        y_l = lidar_xyz[:, 1]
+        z_l = lidar_xyz[:, 2]
+
+        z_shifted = z_l + self.dz
+        x_c = self._cos_p * x_l + self._sin_p * z_shifted
+        y_c = y_l
+        z_c = -self._sin_p * x_l + self._cos_p * z_shifted
+
+        in_front = x_c > 0.1
+
+        u = np.full(n, np.nan, dtype=np.float32)
+        v = np.full(n, np.nan, dtype=np.float32)
+        xf = x_c[in_front]
+        u[in_front] = self.fx * (y_c[in_front] / xf) + self.cx
+        v[in_front] = self.fy * (-z_c[in_front] / xf) + self.cy
+        return u, v, in_front
+
+    # ------------------------------------------------------------------
     # BBox filtering
     # ------------------------------------------------------------------
 

@@ -976,7 +976,67 @@ class DrivingAgent:
         self.show_lane_mask = not self.show_lane_mask
         status = "ON" if self.show_lane_mask else "OFF"
         print(f"Lane mask visualization: {status}")
-    
+
+    # ------------------------------------------------------------------
+    # LiDAR cluster overlay (3D wireframe boxes projected onto camera)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _color_for_track(track_id: str) -> Tuple[int, int, int]:
+        # Hash integer suffix → HSV hue → BGR. The ×47 step (≈ 180·(1-1/φ))
+        # spreads adjacent IDs to well-separated hues.
+        import numpy as np
+        if track_id.startswith('t'):
+            try:
+                n = int(track_id[1:])
+            except ValueError:
+                n = abs(hash(track_id))
+        else:
+            n = abs(hash(track_id))
+        hue = int((n * 47) % 180)
+        bgr = cv2.cvtColor(np.uint8([[[hue, 220, 255]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+    _CLUSTER_BOX_EDGES = (
+        (0, 1), (1, 2), (2, 3), (3, 0),   # bottom rectangle
+        (4, 5), (5, 6), (6, 7), (7, 4),   # top rectangle
+        (0, 4), (1, 5), (2, 6), (3, 7),   # vertical pillars
+    )
+
+    def _draw_lidar_cluster_boxes(self, vis, lidar_obstacles):
+        """Draw a 3D wireframe AABB on the camera image for each LidarObstacle."""
+        if not lidar_obstacles or self.lidar_fusion is None:
+            return vis
+        import numpy as np
+        proj = self.lidar_fusion.projector
+        for obs in lidar_obstacles:
+            corners = np.array([
+                [obs.bbox_min_x, obs.bbox_min_y, obs.bbox_min_z],
+                [obs.bbox_max_x, obs.bbox_min_y, obs.bbox_min_z],
+                [obs.bbox_max_x, obs.bbox_max_y, obs.bbox_min_z],
+                [obs.bbox_min_x, obs.bbox_max_y, obs.bbox_min_z],
+                [obs.bbox_min_x, obs.bbox_min_y, obs.bbox_max_z],
+                [obs.bbox_max_x, obs.bbox_min_y, obs.bbox_max_z],
+                [obs.bbox_max_x, obs.bbox_max_y, obs.bbox_max_z],
+                [obs.bbox_min_x, obs.bbox_max_y, obs.bbox_max_z],
+            ], dtype=np.float32)
+            u, v, in_front = proj.project_xyz_unclipped(corners)
+            if int(in_front.sum()) < 4:
+                continue
+            color = self._color_for_track(obs.track_id or '')
+            for a, b in self._CLUSTER_BOX_EDGES:
+                if not (in_front[a] and in_front[b]):
+                    continue
+                pa = (int(u[a]), int(v[a]))
+                pb = (int(u[b]), int(v[b]))
+                cv2.line(vis, pa, pb, color, 2, cv2.LINE_AA)
+            # Track-ID tag near the top-front-left corner (corner 4 → min_x,min_y,max_z)
+            if in_front[4] and obs.track_id:
+                cv2.putText(vis, obs.track_id,
+                            (int(u[4]), max(12, int(v[4]) - 4)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+        return vis
+
     def visualize(self, image, result: Dict) -> Tuple:
         """Create visualization"""
         # Start with traffic light visualization if available
@@ -1072,7 +1132,13 @@ class DrivingAgent:
                     lbl = f"[LIDAR-ONLY] unknown  {dist:.1f}m  {angle:+.0f}deg({side}){id_tag}"
                     cv2.putText(vis, lbl, (10, vis.shape[0] - 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
-        
+
+            # LiDAR cluster 3D wireframe boxes — gated on BEV toggle (P key)
+            if self.show_lidar_view:
+                vis = self._draw_lidar_cluster_boxes(
+                    vis, obs_data.get('lidar_obstacles', [])
+                )
+
         # Draw HUD
         speed = self._get_vehicle_speed()
         decision = result['decision']
