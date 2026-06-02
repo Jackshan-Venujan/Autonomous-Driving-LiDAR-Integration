@@ -18,6 +18,7 @@ from modules.lane_detector import LaneDetector
 from modules.obstacle_detector import ObstacleDetector
 from modules.traffic_light_detector import TrafficLightDetector
 from modules.lead_vehicle_controller import LeadVehicleController
+from modules.rear_camera_processor import RearCameraProcessor
 from core.pid_controller import PIDController
 from core.curvature_steering import CurvatureSteeringController
 from core.carla_spawner import CarlaSpawner
@@ -126,9 +127,16 @@ class DrivingAgent:
         # Spawner for traffic
         self.spawner = None
         
+        # Rear camera processor — shares YOLO model, has its own lane detector
+        self.rear_processor = RearCameraProcessor(
+            obstacle_detector=self.obstacle_detector,
+            img_w=self.lane_detector.img_w,
+            img_h=self.lane_detector.img_h
+        )
+
         # Visualization flags
-        self.show_lane_mask = False  # NEW: Toggle with V key
-        
+        self.show_lane_mask = False  # Toggle with V key
+
         # Load ROI initially
         print("🔎 Checking for saved ROI...")
         self.lane_detector.roi_selector.load_from_csv()
@@ -257,9 +265,9 @@ class DrivingAgent:
         control.reverse = bool(self.manual_reverse)
         return control
     
-    def process_frame(self, image):
+    def process_frame(self, image, rear_image=None):
         """Process single frame and return control decision"""
-        
+
         # Update lead vehicle (if enabled)
         self.lead_vehicle.update()
         
@@ -268,6 +276,9 @@ class DrivingAgent:
         if self.traffic_light_enabled:
             traffic_light_data = self.traffic_light_detector.detect(image)
         
+        # Current speed used by both manual and auto paths
+        current_speed = self._get_vehicle_speed()
+
         # Manual mode
         if self.mode == 'manual':
             lane_result = self.lane_detector.detect(image)
@@ -294,7 +305,10 @@ class DrivingAgent:
                 lane_detections = []
             
             control = self.apply_manual_control()
-            
+
+            rear_data = self.rear_processor.process(rear_image, current_speed) \
+                if rear_image is not None else None
+
             return {
                 'control': control,
                 'lane_data': lane_result,
@@ -305,6 +319,7 @@ class DrivingAgent:
                     'should_stop': False
                 },
                 'traffic_light_data': traffic_light_data,
+                'rear_data': rear_data,
                 'decision': 'MANUAL CONTROL'
             }
         
@@ -313,15 +328,14 @@ class DrivingAgent:
         if lane_result is None:
             result = self._emergency_stop()
             result['traffic_light_data'] = traffic_light_data
+            result['rear_data'] = self.rear_processor.process(rear_image, current_speed) \
+                if rear_image is not None else None
             return result
         # Update lane count for speed policy
         self.last_lanes_detected = lane_result.get('lanes_detected', 0)
         
         lateral_error = self.lane_detector.compute_lateral_error(lane_result['filtered_lanes'])
-        
-        # Get current speed for adaptive detection
-        current_speed = self._get_vehicle_speed()
-        
+
         all_detections, _ = self.obstacle_detector.detect(image, vehicle_speed_kmh=current_speed)
         
         # CREATE LANE MASK with TRIANGULAR ROI
@@ -385,7 +399,10 @@ class DrivingAgent:
         kappa, kappa_cls = self.lane_detector.compute_centerline_curvature()
         self.last_curvature = kappa
         self.last_curvature_class = kappa_cls
-        
+
+        rear_data = self.rear_processor.process(rear_image, current_speed) \
+            if rear_image is not None else None
+
         return {
             'control': control,
             'lane_data': lane_result,
@@ -396,6 +413,7 @@ class DrivingAgent:
                 'obstacle_action': obstacle_action
             },
             'traffic_light_data': traffic_light_data,
+            'rear_data': rear_data,
             'decision': decision
         }
     
@@ -773,8 +791,13 @@ class DrivingAgent:
         status = "ON" if self.show_lane_mask else "OFF"
         print(f"Lane mask visualization: {status}")
     
-    def visualize(self, image, result: Dict) -> Tuple:
-        """Create visualization"""
+    def visualize(self, image, result: Dict, rear_image=None) -> Tuple:
+        """
+        Create visualization frames.
+
+        Returns:
+            (front_vis, rear_vis)  — rear_vis is None when no rear data is available.
+        """
         # Start with traffic light visualization if available
         if result.get('traffic_light_data'):
             vis = result['traffic_light_data']['visualization'].copy()
@@ -888,11 +911,32 @@ class DrivingAgent:
             cv2.putText(vis, f"Lead Vehicle: {lead_status['distance']:.1f}m @ {lead_status['speed']:.1f} km/h", 
                        (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 255), 2)
         
+        # Rear camera lane-change safety summary on front HUD
+        rear_data = result.get('rear_data')
+        if rear_data:
+            safety = rear_data.get('lane_change_safety', {})
+            _scol = {'safe': (0, 200, 0), 'warning': (0, 165, 255), 'danger': (0, 0, 220)}
+            _slbl = {'safe': 'SAFE', 'warning': 'CAUTION', 'danger': 'DANGER'}
+            ls = safety.get('left', 'safe')
+            rs = safety.get('right', 'safe')
+            cv2.putText(vis,
+                        f"REAR  L:{_slbl.get(ls,'?')}  R:{_slbl.get(rs,'?')}",
+                        (vis.shape[1] - 300, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        _scol.get('danger' if 'danger' in (ls, rs) else
+                                  'warning' if 'warning' in (ls, rs) else 'safe',
+                                  (200, 200, 200)), 2)
+
         # Controls help
-        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Lane Mask [T]=Lead Vehicle [W/S/A/D]=Drive [Q]=Quit", 
+        cv2.putText(vis, "[M]=Manual [L]=Auto [V]=Mask [T]=Lead [W/S/A/D]=Drive [Q]=Quit",
                    (10, vis.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 2)
-        
-        return vis, None
+
+        # Build rear visualisation
+        vis_rear = None
+        if rear_data is not None and rear_image is not None:
+            vis_rear = self.rear_processor.visualize(rear_image, rear_data)
+
+        return vis, vis_rear
     
     def cleanup(self):
         """Cleanup resources"""

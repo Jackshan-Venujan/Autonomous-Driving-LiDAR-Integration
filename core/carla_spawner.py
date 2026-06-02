@@ -198,30 +198,37 @@ class CarlaSpawner:
         return pedestrians_spawned
     
     def cleanup(self):
-        """Destroy all spawned actors - safe version"""
-        if len(self.spawned_actors) > 0:
-            print(f"\n🧹 Cleaning up {len(self.spawned_actors)} spawned actors...")
-            destroyed_count = 0
-            already_destroyed_count = 0
-            error_count = 0
-            
-            for actor in self.spawned_actors:
-                try:
-                    # Check if actor still exists in world
-                    if hasattr(actor, 'is_alive') and actor.is_alive:
-                        actor.destroy()
-                        destroyed_count += 1
-                    else:
-                        already_destroyed_count += 1
-                except RuntimeError as e:
-                    # Actor already destroyed
-                    if "destroyed actor" in str(e).lower():
-                        already_destroyed_count += 1
-                    else:
-                        error_count += 1
-                except Exception as e:
-                    # Any other error - just count and continue
-                    error_count += 1
-            
-            self.spawned_actors.clear()
-            print(f"   ✓ Destroyed: {destroyed_count}, Already gone: {already_destroyed_count}, Errors: {error_count}")
+        """Destroy all spawned actors safely."""
+        if not self.spawned_actors:
+            return
+
+        print(f"\n🧹 Cleaning up {len(self.spawned_actors)} spawned actors...")
+
+        # Step 1: Deregister all autopilot vehicles from Traffic Manager FIRST.
+        # TM runs background threads; destroying a TM-managed actor without
+        # deregistering it first causes a C++ std::terminate crash.
+        for actor in self.spawned_actors:
+            try:
+                if hasattr(actor, 'set_autopilot'):
+                    actor.set_autopilot(False)
+            except:  # noqa: bare-except — C++ exceptions bypass Python handlers
+                pass
+
+        # Give TM time to deregister before we touch the actors
+        time.sleep(0.3)
+
+        # Step 2: Destroy every actor.
+        # Do NOT check actor.is_alive — that property itself throws a C++
+        # std::runtime_error when the server-side object is already gone,
+        # which also propagates as std::terminate.
+        destroyed = 0
+        skipped = 0
+        for actor in self.spawned_actors:
+            try:
+                actor.destroy()
+                destroyed += 1
+            except:  # noqa: bare-except — catches both Python and C++ exceptions
+                skipped += 1
+
+        self.spawned_actors.clear()
+        print(f"   ✓ Destroyed: {destroyed}, Already gone: {skipped}")

@@ -61,10 +61,21 @@ class AutonomousDrivingSystem:
             carla.Rotation(pitch=-15)
         )
         self.camera = self.world.spawn_actor(camera_bp, cam_transform, attach_to=self.vehicle)
-        
+
         self.camera_data = None
         self.camera.listen(lambda image: self._camera_callback(image))
-        
+
+        # Rear camera — faces backward, slight downward tilt to capture road
+        rear_cam_transform = carla.Transform(
+            carla.Location(x=-2.5, z=1.4),
+            carla.Rotation(pitch=-10, yaw=180)
+        )
+        self.rear_camera = self.world.spawn_actor(
+            camera_bp, rear_cam_transform, attach_to=self.vehicle
+        )
+        self.rear_camera_data = None
+        self.rear_camera.listen(lambda image: self._rear_camera_callback(image))
+
         # Initialize driving agent
         self.agent = DrivingAgent(self.world, self.vehicle)
         
@@ -75,10 +86,16 @@ class AutonomousDrivingSystem:
         import numpy as np
         array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
         array = np.reshape(array, (image.height, image.width, 4))
-        # CARLA gives BGRA, we want BGR (drop alpha channel)
-        # No need to reverse channels - OpenCV expects BGR
         array = array[:, :, :3]  # Keep BGR, drop alpha
         self.camera_data = array
+
+    def _rear_camera_callback(self, image):
+        """Rear camera callback"""
+        import numpy as np
+        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+        array = np.reshape(array, (image.height, image.width, 4))
+        array = array[:, :, :3]
+        self.rear_camera_data = array
     
     def run(self, duration=300, spawn_traffic=True):
         """Run autonomous driving"""
@@ -92,6 +109,7 @@ class AutonomousDrivingSystem:
         print("  [W/A/S/D] = Manual throttle/brake/steering")
         print("  [Space] = Brake")
         print("  [Q] = Quit")
+        print("  Rear Camera window: BLIND SPOT MONITOR (always on)")
         print("="*70)
         print("\n⚠️  Vehicle starts in MANUAL mode")
         print("⚠️  Press [L] to enable AUTONOMOUS driving")
@@ -101,16 +119,16 @@ class AutonomousDrivingSystem:
         else:
             print("⚠️  Traffic Light Detection: DISABLED\n")
         
-        # Wait for camera
-        print("⏳ Waiting for camera...")
+        # Wait for both cameras
+        print("⏳ Waiting for cameras...")
         wait_start = time.time()
-        while self.camera_data is None:
+        while self.camera_data is None or self.rear_camera_data is None:
             if time.time() - wait_start > 10:
                 print("❌ Camera timeout")
                 return
             time.sleep(0.1)
             self.world.tick()
-        print("✓ Camera ready")
+        print("✓ Front and rear cameras ready")
         
         # Spawn traffic
         if spawn_traffic:
@@ -166,17 +184,24 @@ class AutonomousDrivingSystem:
                 if key == ord('q'):
                     break
                 
-                # Process frame
-                result = self.agent.process_frame(self.camera_data)
-                
+                # Process frame (front + rear)
+                result = self.agent.process_frame(
+                    self.camera_data, rear_image=self.rear_camera_data
+                )
+
                 # Apply control
                 self.vehicle.apply_control(result['control'])
-                
-                # Visualize
-                vis, _ = self.agent.visualize(self.camera_data, result)
-                
+
+                # Visualize — front HUD and rear window
+                vis, vis_rear = self.agent.visualize(
+                    self.camera_data, result, rear_image=self.rear_camera_data
+                )
+
                 if vis is not None:
                     cv2.imshow('Autonomous Driving - Modular', vis)
+
+                if vis_rear is not None:
+                    cv2.imshow('Rear Camera - Blind Spot Monitor', vis_rear)
                 
                 # Status
                 if frame_count % 100 == 0:
@@ -218,14 +243,16 @@ class AutonomousDrivingSystem:
         except Exception as e:
             print(f"   ⚠️ Error in agent cleanup: {e}")
         
-        # 4. Destroy camera BEFORE vehicle
-        try:
-            if hasattr(self, 'camera') and self.camera is not None:
-                self.camera.stop()  # Stop listening first
-                time.sleep(0.1)  # Give it time
-                self.camera.destroy()
-        except Exception as e:
-            print(f"   ⚠️ Camera cleanup error: {e}")
+        # 4. Destroy cameras BEFORE vehicle
+        for cam_attr, label in [('camera', 'front'), ('rear_camera', 'rear')]:
+            try:
+                cam = getattr(self, cam_attr, None)
+                if cam is not None:
+                    cam.stop()
+                    time.sleep(0.05)
+                    cam.destroy()
+            except Exception as e:
+                print(f"   ⚠️ {label} camera cleanup error: {e}")
         
         # 5. Destroy vehicle last
         try:

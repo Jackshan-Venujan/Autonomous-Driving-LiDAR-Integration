@@ -78,9 +78,16 @@ class LeadVehicleController:
             return
         
         try:
-            if not self.lead_vehicle.is_alive:
+            # is_alive can raise a C++ std::runtime_error if the server-side
+            # object is gone; treat any exception as "vehicle destroyed"
+            try:
+                alive = self.lead_vehicle.is_alive
+            except:
+                alive = False
+            if not alive:
                 print("⚠️ Lead vehicle destroyed")
                 self.enabled = False
+                self.lead_vehicle = None
                 return
             
             ego_loc = self.ego_vehicle.get_transform().location
@@ -205,16 +212,10 @@ class LeadVehicleController:
         """Clean up lead vehicle"""
         if self.lead_vehicle is not None:
             try:
-                control = carla.VehicleControl()
-                control.throttle = 0.0
-                control.brake = 1.0
-                self.lead_vehicle.apply_control(control)
-                self.world.tick()
-                time.sleep(0.05)
                 self.lead_vehicle.destroy()
                 print("✓ Lead vehicle destroyed")
-            except Exception as e:
-                print(f"⚠️ Error destroying lead vehicle: {e}")
+            except:  # noqa: bare-except — C++ exceptions bypass Python handlers
+                pass
             finally:
                 self.lead_vehicle = None
                 self.enabled = False
