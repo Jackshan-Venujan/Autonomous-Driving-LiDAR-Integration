@@ -19,6 +19,8 @@ from modules.obstacle_detector import ObstacleDetector
 from modules.traffic_light_detector import TrafficLightDetector
 from modules.lead_vehicle_controller import LeadVehicleController
 from modules.rear_camera_processor import RearCameraProcessor
+from modules.lidar_processor import LidarProcessor
+from modules.bev_visualizer import BEVVisualizer
 from core.pid_controller import PIDController
 from core.curvature_steering import CurvatureSteeringController
 from core.carla_spawner import CarlaSpawner
@@ -133,6 +135,17 @@ class DrivingAgent:
             img_w=self.lane_detector.img_w,
             img_h=self.lane_detector.img_h
         )
+
+        # LiDAR processor + BEV visualizer
+        self.lidar_processor = LidarProcessor(
+            ground_z_threshold=-1.5,
+            self_hit_radius=2.5,
+            max_range=50.0,
+            eps=0.5,
+            min_samples=5,
+        )
+        self.bev_visualizer = BEVVisualizer(range_m=60, canvas_size=700)
+        self.latest_lidar_obstacles = []
 
         # Visualization flags
         self.show_lane_mask = False  # Toggle with V key
@@ -938,6 +951,28 @@ class DrivingAgent:
 
         return vis, vis_rear
     
+    def process_lidar(self, raw_lidar_data) -> dict:
+        """Run LiDAR pipeline and return obstacle list + ground-removed points."""
+        if raw_lidar_data is None:
+            return {'obstacles': [], 'points': None, 'nearest_front': None, 'nearest_rear': None}
+        obstacles = self.lidar_processor.process(raw_lidar_data)
+        self.latest_lidar_obstacles = obstacles
+        return {
+            'obstacles': obstacles,
+            'points': self.lidar_processor.last_points,
+            'nearest_front': self.lidar_processor.get_nearest_obstacle('front'),
+            'nearest_rear':  self.lidar_processor.get_nearest_obstacle('rear'),
+        }
+
+    def visualize_bev(self, lidar_result: dict):
+        """Render BEV map from LiDAR result dict; returns BGR image or None."""
+        if lidar_result is None:
+            return None
+        return self.bev_visualizer.render(
+            lidar_result.get('points'),
+            lidar_result.get('obstacles', []),
+        )
+
     def cleanup(self):
         """Cleanup resources"""
         # Cleanup lead vehicle first

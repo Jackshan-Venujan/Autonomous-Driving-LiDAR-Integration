@@ -76,6 +76,19 @@ class AutonomousDrivingSystem:
         self.rear_camera_data = None
         self.rear_camera.listen(lambda image: self._rear_camera_callback(image))
 
+        # LiDAR sensor — roof-mounted ray-cast sensor (simulates Velodyne HDL-64E)
+        lidar_bp = bp.find('sensor.lidar.ray_cast')
+        lidar_bp.set_attribute('channels',          '64')
+        lidar_bp.set_attribute('range',             '50')
+        lidar_bp.set_attribute('points_per_second', '1300000')
+        lidar_bp.set_attribute('rotation_frequency','20')
+        lidar_bp.set_attribute('upper_fov',         '10')
+        lidar_bp.set_attribute('lower_fov',         '-30')
+        lidar_transform = carla.Transform(carla.Location(x=0.0, y=0.0, z=2.0))
+        self.lidar = self.world.spawn_actor(lidar_bp, lidar_transform, attach_to=self.vehicle)
+        self.lidar_data = None
+        self.lidar.listen(lambda data: self._lidar_callback(data))
+
         # Initialize driving agent
         self.agent = DrivingAgent(self.world, self.vehicle)
         
@@ -96,6 +109,10 @@ class AutonomousDrivingSystem:
         array = np.reshape(array, (image.height, image.width, 4))
         array = array[:, :, :3]
         self.rear_camera_data = array
+
+    def _lidar_callback(self, data):
+        """LiDAR callback — store raw measurement; LidarProcessor handles parsing."""
+        self.lidar_data = data
     
     def run(self, duration=300, spawn_traffic=True):
         """Run autonomous driving"""
@@ -119,16 +136,16 @@ class AutonomousDrivingSystem:
         else:
             print("⚠️  Traffic Light Detection: DISABLED\n")
         
-        # Wait for both cameras
-        print("⏳ Waiting for cameras...")
+        # Wait for cameras and LiDAR
+        print("⏳ Waiting for sensors...")
         wait_start = time.time()
-        while self.camera_data is None or self.rear_camera_data is None:
+        while self.camera_data is None or self.rear_camera_data is None or self.lidar_data is None:
             if time.time() - wait_start > 10:
-                print("❌ Camera timeout")
+                print("❌ Sensor timeout")
                 return
             time.sleep(0.1)
             self.world.tick()
-        print("✓ Front and rear cameras ready")
+        print("✓ Front camera, rear camera, and LiDAR ready")
         
         # Spawn traffic
         if spawn_traffic:
@@ -192,6 +209,10 @@ class AutonomousDrivingSystem:
                 # Apply control
                 self.vehicle.apply_control(result['control'])
 
+                # LiDAR — process point cloud and render BEV map
+                lidar_result = self.agent.process_lidar(self.lidar_data)
+                vis_bev = self.agent.visualize_bev(lidar_result)
+
                 # Visualize — front HUD and rear window
                 vis, vis_rear = self.agent.visualize(
                     self.camera_data, result, rear_image=self.rear_camera_data
@@ -202,6 +223,9 @@ class AutonomousDrivingSystem:
 
                 if vis_rear is not None:
                     cv2.imshow('Rear Camera - Blind Spot Monitor', vis_rear)
+
+                if vis_bev is not None:
+                    cv2.imshow('LiDAR BEV - Obstacle Map', vis_bev)
                 
                 # Status
                 if frame_count % 100 == 0:
@@ -243,8 +267,8 @@ class AutonomousDrivingSystem:
         except Exception as e:
             print(f"   ⚠️ Error in agent cleanup: {e}")
         
-        # 4. Destroy cameras BEFORE vehicle
-        for cam_attr, label in [('camera', 'front'), ('rear_camera', 'rear')]:
+        # 4. Destroy LiDAR and cameras BEFORE vehicle
+        for cam_attr, label in [('lidar', 'lidar'), ('camera', 'front'), ('rear_camera', 'rear')]:
             try:
                 cam = getattr(self, cam_attr, None)
                 if cam is not None:
