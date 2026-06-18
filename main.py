@@ -65,13 +65,17 @@ class AutonomousDrivingSystem:
         self.camera_data = None
         self.camera.listen(lambda image: self._camera_callback(image))
 
-        # Rear camera — faces backward, slight downward tilt to capture road
+        # Rear camera — faces backward, 120° FOV for wider blind-spot coverage
+        rear_camera_bp = bp.find('sensor.camera.rgb')
+        rear_camera_bp.set_attribute('image_size_x', '1280')
+        rear_camera_bp.set_attribute('image_size_y', '720')
+        rear_camera_bp.set_attribute('fov', '120')   # wider than front (90°)
         rear_cam_transform = carla.Transform(
             carla.Location(x=-2.5, z=1.4),
             carla.Rotation(pitch=-10, yaw=180)
         )
         self.rear_camera = self.world.spawn_actor(
-            camera_bp, rear_cam_transform, attach_to=self.vehicle
+            rear_camera_bp, rear_cam_transform, attach_to=self.vehicle
         )
         self.rear_camera_data = None
         self.rear_camera.listen(lambda image: self._rear_camera_callback(image))
@@ -209,13 +213,35 @@ class AutonomousDrivingSystem:
                 # Apply control
                 self.vehicle.apply_control(result['control'])
 
-                # LiDAR — process point cloud and render BEV map
+                # LiDAR — process point cloud
                 lidar_result = self.agent.process_lidar(self.lidar_data)
-                vis_bev = self.agent.visualize_bev(lidar_result)
 
-                # Visualize — front HUD and rear window
+                # LiDAR-Camera fusion — project LiDAR into both cameras,
+                # fuse with YOLO detections for accurate depth per obstacle
+                front_dets = (result['obstacle_data'].get('all_detections', [])
+                              if result.get('obstacle_data') else [])
+                rear_dets  = (result['rear_data'].get('all_detections', [])
+                              if result.get('rear_data') else [])
+                fusion = self.agent.run_lidar_camera_fusion(
+                    lidar_result, front_dets, rear_dets
+                )
+
+                # Log per-object fusion data at ~5 fps
+                self.agent.fusion_logger.log_frame(
+                    frame_count,
+                    fusion['front']['detections'],
+                    fusion['rear']['detections'],
+                    fusion['lidar_obstacles'],
+                )
+
+                # Render BEV with camera FOV cones + class labels
+                vis_bev = self.agent.visualize_bev(lidar_result, fusion=fusion)
+
+                # Visualize — front HUD and rear window (with LiDAR overlay)
                 vis, vis_rear = self.agent.visualize(
-                    self.camera_data, result, rear_image=self.rear_camera_data
+                    self.camera_data, result,
+                    rear_image=self.rear_camera_data,
+                    fusion=fusion,
                 )
 
                 if vis is not None:

@@ -53,6 +53,7 @@ class BEVVisualizer:
         self,
         points_xyz: Optional[np.ndarray],
         obstacles: List[Dict],
+        fusion: Optional[Dict] = None,
     ) -> np.ndarray:
         """
         Build and return a 700×700 BGR BEV image.
@@ -61,14 +62,24 @@ class BEVVisualizer:
             points_xyz: (N, 3) ground-removed point cloud in sensor frame,
                         or None when no data is available.
             obstacles:  List of obstacle dicts from LidarProcessor.process().
+            fusion:     Optional dict from DrivingAgent.run_lidar_camera_fusion().
+                        When provided, draws camera FOV cones and adds YOLO class
+                        labels to clusters that were detected by a camera.
         """
         canvas = np.zeros((self.canvas_size, self.canvas_size, 3), dtype=np.uint8)
         self._draw_grid(canvas)
 
+        # Camera FOV cones (drawn before points so they are in background)
+        if fusion is not None:
+            self._draw_camera_fov_cones(canvas, fusion)
+
         if points_xyz is not None and len(points_xyz) > 0:
             self._draw_points(canvas, points_xyz)
 
-        self._draw_clusters(canvas, obstacles)
+        # Build cluster → camera class mapping from fusion
+        cluster_class_map = self._build_cluster_class_map(obstacles, fusion)
+
+        self._draw_clusters(canvas, obstacles, cluster_class_map)
         self._draw_ego(canvas)
         self._draw_hud(canvas, obstacles)
         self._draw_scale_bar(canvas)
@@ -168,8 +179,104 @@ class BEVVisualizer:
                 return color
         return _DIST_COLORS[-1][1]
 
-    def _draw_clusters(self, canvas: np.ndarray, obstacles: List[Dict]) -> None:
-        for obs in obstacles:
+    def _build_cluster_class_map(
+        self,
+        obstacles: List[Dict],
+        fusion: Optional[Dict],
+    ) -> Dict[int, str]:
+        """
+        Match each LiDAR cluster to a YOLO class label from fusion data.
+
+        Strategy: for each camera detection that has a valid lidar_distance,
+        find the cluster whose distance is within 3 m of that lidar_distance.
+        Returns {cluster_id: class_label}.
+        """
+        if fusion is None or not obstacles:
+            return {}
+
+        class_map: Dict[int, str] = {}
+        tolerance = 3.0  # metres
+
+        for cam_key in ('front', 'rear'):
+            cam_data = fusion.get(cam_key, {})
+            for det in cam_data.get('detections', []):
+                lid_d = det.get('lidar_distance')
+                cls   = det.get('class', '')
+                if lid_d is None or not cls:
+                    continue
+                for obs in obstacles:
+                    if abs(obs['distance'] - lid_d) < tolerance:
+                        if obs['id'] not in class_map:
+                            class_map[obs['id']] = cls
+                        break
+
+        return class_map
+
+    def _draw_camera_fov_cones(
+        self,
+        canvas: np.ndarray,
+        fusion: Dict,
+        front_fov_deg: float = 90.0,
+        rear_fov_deg: float  = 120.0,
+        cone_range_m: float  = 50.0,
+        alpha: float         = 0.15,
+    ) -> None:
+        """
+        Draw semi-transparent FOV cones for front (90°) and rear (120°) cameras.
+
+        Front cone: centred on +x axis (forward), faint blue.
+        Rear  cone: centred on -x axis (rearward), faint cyan.
+        """
+        overlay = canvas.copy()
+        c       = self.center
+        r_px    = int(cone_range_m * self.scale)
+
+        def _cone_points(centre_angle_deg: float, half_fov_deg: float) -> np.ndarray:
+            """Return polygon vertices for a cone on the BEV canvas."""
+            pts = [(c, c)]   # apex at ego
+            n_steps = 30
+            for i in range(n_steps + 1):
+                theta_sensor = (
+                    centre_angle_deg - half_fov_deg
+                    + 2 * half_fov_deg * i / n_steps
+                )
+                # sensor frame: x=forward, y=right
+                # canvas: forward→up (row decreases), right→col increases
+                sx = math.cos(math.radians(theta_sensor))  # forward component
+                sy = math.sin(math.radians(theta_sensor))  # right component
+                col = int(c + sy * r_px)
+                row = int(c - sx * r_px)
+                pts.append((col, row))
+            return np.array(pts, dtype=np.int32)
+
+        # Front camera: looking forward (0°), half-fov = front_fov_deg / 2
+        front_pts = _cone_points(0.0, front_fov_deg / 2.0)
+        cv2.fillPoly(overlay, [front_pts], (180, 80, 0))   # faint blue-ish
+
+        # Rear camera: looking rearward (180°), half-fov = rear_fov_deg / 2
+        rear_pts = _cone_points(180.0, rear_fov_deg / 2.0)
+        cv2.fillPoly(overlay, [rear_pts], (140, 120, 0))   # faint cyan-ish
+
+        cv2.addWeighted(overlay, alpha, canvas, 1.0 - alpha, 0, canvas)
+
+        # Label the cones
+        lc = (100, 140, 200)
+        cv2.putText(canvas, f"FrontCam {int(front_fov_deg)}deg",
+                    (c - 44, c - r_px + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, lc, 1)
+        cv2.putText(canvas, f"RearCam {int(rear_fov_deg)}deg",
+                    (c - 41, c + r_px - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, lc, 1)
+
+    def _draw_clusters(
+        self,
+        canvas: np.ndarray,
+        obstacles: List[Dict],
+        cluster_class_map: Optional[Dict[int, str]] = None,
+    ) -> None:
+        if cluster_class_map is None:
+            cluster_class_map = {}
+        for rank, obs in enumerate(obstacles):
             color = self._dist_color(obs['distance'])
             min_x, min_y, max_x, max_y = obs['bbox_3d']
 
@@ -188,11 +295,17 @@ class BEVVisualizer:
             if self._in_bounds(*cc):
                 cv2.circle(canvas, cc, 4, color, -1)
 
-            # Distance label near centroid
-            lx = max(4, min(cc[0] + 6, self.canvas_size - 52))
+            # Label: "#rank class dist"
+            cls_label = cluster_class_map.get(obs['id'], '')
+            if cls_label:
+                label = f"#{rank} {cls_label} {obs['distance']:.1f}m"
+            else:
+                label = f"#{rank} {obs['distance']:.1f}m"
+
+            lx = max(4, min(cc[0] + 6, self.canvas_size - 80))
             ly = max(10, min(cc[1] - 5, self.canvas_size - 4))
-            cv2.putText(canvas, f"{obs['distance']:.1f}m",
-                        (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (230, 230, 230), 1)
+            cv2.putText(canvas, label,
+                        (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (230, 230, 230), 1)
 
     def _draw_ego(self, canvas: np.ndarray) -> None:
         c = self.center

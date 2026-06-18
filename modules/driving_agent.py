@@ -21,6 +21,8 @@ from modules.lead_vehicle_controller import LeadVehicleController
 from modules.rear_camera_processor import RearCameraProcessor
 from modules.lidar_processor import LidarProcessor
 from modules.bev_visualizer import BEVVisualizer
+from modules.lidar_camera_fusion import LidarCameraFusion
+from modules.fusion_logger import FusionLogger
 from core.pid_controller import PIDController
 from core.curvature_steering import CurvatureSteeringController
 from core.carla_spawner import CarlaSpawner
@@ -146,6 +148,13 @@ class DrivingAgent:
         )
         self.bev_visualizer = BEVVisualizer(range_m=60, canvas_size=700)
         self.latest_lidar_obstacles = []
+
+        # LiDAR-camera fusion + CSV logger
+        # Front FOV stays 90°; rear camera was changed to 120° in main.py
+        self.lidar_fusion  = LidarCameraFusion(
+            img_w=1280, img_h=720, front_fov=90.0, rear_fov=120.0
+        )
+        self.fusion_logger = FusionLogger(log_dir='logs')
 
         # Visualization flags
         self.show_lane_mask = False  # Toggle with V key
@@ -804,9 +813,13 @@ class DrivingAgent:
         status = "ON" if self.show_lane_mask else "OFF"
         print(f"Lane mask visualization: {status}")
     
-    def visualize(self, image, result: Dict, rear_image=None) -> Tuple:
+    def visualize(self, image, result: Dict, rear_image=None, fusion: Dict = None) -> Tuple:
         """
         Create visualization frames.
+
+        Args:
+            fusion: optional dict from run_lidar_camera_fusion(); when present,
+                    draws projected LiDAR points and enriched detection labels.
 
         Returns:
             (front_vis, rear_vis)  — rear_vis is None when no rear data is available.
@@ -817,6 +830,14 @@ class DrivingAgent:
         else:
             vis = image.copy()
         
+        # Draw dense projected LiDAR points (blue=ground, red→green=obstacles)
+        if fusion is not None:
+            f_fus = fusion['front']
+            vis = self.lidar_fusion.draw_projected_points(
+                vis, f_fus['proj_uv'], f_fus['depths'], f_fus['valid'],
+                z_vehicle=f_fus.get('z_vehicle')
+            )
+
         # NEW: Draw lane mask using YOLOLaneFilter (the working one)
         if self.show_lane_mask:
             if result['lane_data'] and result['lane_data']['filtered_lanes']:
@@ -852,11 +873,13 @@ class DrivingAgent:
                     points = np.array(lane, dtype=np.int32)
                     cv2.polylines(vis, [points], False, color, 2)
         
-        # Draw obstacles
-        if result['obstacle_data']:
+        # Draw obstacles — use fusion-enriched labels when fusion is available
+        if fusion is not None and fusion['front']['detections']:
+            vis = self.lidar_fusion.draw_fused_detections(vis, fusion['front']['detections'])
+        elif result['obstacle_data']:
             obs_data = result['obstacle_data']
             vis = self.obstacle_detector.visualize(
-                vis, 
+                vis,
                 obs_data['lane_detections'],
                 None
             )
@@ -948,6 +971,18 @@ class DrivingAgent:
         vis_rear = None
         if rear_data is not None and rear_image is not None:
             vis_rear = self.rear_processor.visualize(rear_image, rear_data)
+            # Overlay dense LiDAR points projected into rear camera
+            if fusion is not None and vis_rear is not None:
+                r_fus = fusion['rear']
+                vis_rear = self.lidar_fusion.draw_projected_points(
+                    vis_rear, r_fus['proj_uv'], r_fus['depths'], r_fus['valid'],
+                    z_vehicle=r_fus.get('z_vehicle')
+                )
+                # Draw enriched detection boxes on rear image
+                if r_fus['detections']:
+                    vis_rear = self.lidar_fusion.draw_fused_detections(
+                        vis_rear, r_fus['detections']
+                    )
 
         return vis, vis_rear
     
@@ -964,13 +999,67 @@ class DrivingAgent:
             'nearest_rear':  self.lidar_processor.get_nearest_obstacle('rear'),
         }
 
-    def visualize_bev(self, lidar_result: dict):
+    def run_lidar_camera_fusion(
+        self,
+        lidar_result: dict,
+        front_dets: list,
+        rear_dets: list,
+    ) -> dict:
+        """
+        Project LiDAR point cloud into front and rear camera images,
+        fuse with YOLO detections to get accurate LiDAR distance per box.
+
+        Args:
+            lidar_result : dict from process_lidar()
+            front_dets   : all_detections list from front camera obstacle data
+            rear_dets    : all_detections list from rear camera data
+
+        Returns dict with keys:
+            'front'           : {proj_uv, depths, valid, detections}
+            'rear'            : {proj_uv, depths, valid, detections}
+            'lidar_obstacles' : raw obstacle list
+        """
+        pts       = lidar_result.get('points')        # (N,3) or None
+        obstacles = lidar_result.get('obstacles', [])
+
+        # --- Front camera ---
+        uv_f, d_f, mask_f, zv_f = self.lidar_fusion.project_to_camera(pts, camera='front')
+        fused_front = self.lidar_fusion.fuse_with_detections(
+            uv_f, d_f, mask_f, front_dets or []
+        )
+
+        # --- Rear camera ---
+        uv_r, d_r, mask_r, zv_r = self.lidar_fusion.project_to_camera(pts, camera='rear')
+        fused_rear = self.lidar_fusion.fuse_with_detections(
+            uv_r, d_r, mask_r, rear_dets or []
+        )
+
+        return {
+            'front': {
+                'proj_uv':    uv_f,
+                'depths':     d_f,
+                'valid':      mask_f,
+                'z_vehicle':  zv_f,
+                'detections': fused_front,
+            },
+            'rear': {
+                'proj_uv':    uv_r,
+                'depths':     d_r,
+                'valid':      mask_r,
+                'z_vehicle':  zv_r,
+                'detections': fused_rear,
+            },
+            'lidar_obstacles': obstacles,
+        }
+
+    def visualize_bev(self, lidar_result: dict, fusion: dict = None):
         """Render BEV map from LiDAR result dict; returns BGR image or None."""
         if lidar_result is None:
             return None
         return self.bev_visualizer.render(
             lidar_result.get('points'),
             lidar_result.get('obstacles', []),
+            fusion=fusion,
         )
 
     def cleanup(self):
